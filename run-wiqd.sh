@@ -8,5 +8,6 @@ python wiqd.py \
   --charges 1,2,3 \
   --collapse xle \
   --cys_mod none \
-  --rt_tolerance_min 999 \
-  --summary_top_n 40
+  --rt_tolerance_min 1 \
+  --k 4 \
+  --summary_top_n 30
