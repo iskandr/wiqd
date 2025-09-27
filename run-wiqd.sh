@@ -1,0 +1,12 @@
+python wiqd.py \
+  --in pfo010-co.csv  \
+  --outdir out_wiqd \
+  --albumin_source embedded --albumin_use mature \
+  --ppm_tol 30 \
+  --full_mz_len_min 5 --full_mz_len_max 15 \
+  --by_mz_len_min 2 --by_mz_len_max 11 \
+  --charges 1,2,3 \
+  --collapse xle \
+  --cys_mod none \
+  --rt_tolerance_min 999 \
+  --summary_top_n 40
