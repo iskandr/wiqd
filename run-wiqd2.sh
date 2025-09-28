@@ -1,6 +1,6 @@
 for infile in pfo010-co.csv pfo002-2023.csv; do
-  outdir="wiqd-out-${infile%.csv}"
-  python wiqd.py \
+  outdir="wiqd2-out-${infile%.csv}"
+  python wiqd2.py \
     --in "$infile" \
     --outdir "$outdir" \
     --albumin_source embedded --albumin_use mature \
