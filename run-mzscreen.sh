@@ -1,4 +1,4 @@
-for infile in pfo010-co.csv pfo002-2023.csv; do
+for infile in pfo010-co.csv pfo002-ev.csv pfo002-tissue-repeat.csv; do
   outdir="mzscreen-out-${infile%.csv}"
 python mzscreen.py \
   --in "$infile" \

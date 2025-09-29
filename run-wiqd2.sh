@@ -1,4 +1,4 @@
-for infile in pfo010-co.csv pfo002-2023.csv; do
+for infile in pfo010-co.csv pfo002-2023.csv pfo002-tissue-repeat.csv combined-pfo002-repeat-pfo010.csv; do
   outdir="wiqd2-out-${infile%.csv}"
   python wiqd2.py \
     --in "$infile" \
