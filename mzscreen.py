@@ -1,921 +1,1319 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-wiqd_mzscreen_sets_chained.py — Protein-SET m/z screen with chained fragment evidence
+WIQD — What Is Qing Doing?  (Script‑1‑aligned + contamination score)
 
-What it does (per peptide × protein set × mode):
-  1) Precursor m/z matches to protein subsequences (length 5..15 by default) at z∈{1,2,3}, ±ppm:
-       - N_precursor_mz
-       - N_precursor_mz_rt             (also requires RT co-elution within ±rt_tol on a rt_total_min column)
+Hit vs non‑hit peptide analysis against contaminant protein sets (ALONE), with:
 
-  2) Fragment m/z matches (b/y, k=2..7, z∈{1,2,3}, ±ppm):
-       - N_fragment_mz_any,  Frac_fragment_mz_any       (any window)
-       - N_fragment_mz_rt,   Frac_fragment_mz_rt        (any window, RT-gated)
+  • Original Script‑2 metrics (fractions/scores)
+  • Script‑1‑style metrics (counts; chained fragments; 95th‑percentile‑capped confusability)
+  • NEW: Contamination evidence score in [0,1] (±RT), mostly 0, near 1 when strong explanation exists:
+        - 1.0 when: precursor ≤ good_ppm (default 20) AND ≥ N fragment types at ≤ good_ppm
+        - 0 < score < 1 when: precursor ≤ max_ppm (default 30) AND ≥ N fragment types at ≤ max_ppm
+        - 0 otherwise
+        Works with and without RT gating.
 
-     NEW (chained to the precursor-matched window set):
-       - N_fragment_mz_given_precursor,      Frac_fragment_mz_given_precursor
-       - N_fragment_mz_given_precursor_rt,   Frac_fragment_mz_given_precursor_rt   (precursor + RT)
+Extras:
+  • --split_keratin       → splits 'keratins' into one source per accession
+  • Plots for the new score (±RT) per set + cross‑set bar summaries
+  • Enrichment summary CSV for every source (±RT): Δmean(hit−non), MWU p/q, prevalence at score≥0.9
 
-  3) Fragment **sequence** containment (b_k prefix / y_k suffix strings) among precursor-matched windows:
-       - N_fragment_sequence_given_precursor,      Frac_fragment_sequence_given_precursor
-       - N_fragment_sequence_given_precursor_rt,   Frac_fragment_sequence_given_precursor_rt  (precursor + RT)
+Recommended to align with Script 1:
+  --ppm_tol 30 --charges 1,2,3
+  --full_mz_len_min 5 --full_mz_len_max 15
+  --fragment_kmin 2 --fragment_kmax 7
+  --cys_mod none
+  --xle_collapse            # optional I/L collapse for sequence containment
 
-  4) Simple confusability (bounded [0,1]):
-       Confusability_simple = mean( Norm_N_precursor_mz,
-                                    Norm_N_precursor_mz_rt,
-                                    Frac_fragment_mz_given_precursor,
-                                    Frac_fragment_mz_given_precursor_rt )
-     where Norm_N_precursor_* are capped at each set×mode 95th percentile then scaled to [0,1].
-
-Outputs (all per-peptide, normalized where applicable):
-  - per_peptide_scores__ALL.csv
-  - effects_summary__ALL.csv            (Cliff’s δ, group means, prevalence; if is_hit present)
-  - per_peptide_per_protein_counts__ALL.csv  (for protein–protein correlation)
-  - plots/
-      * bar_delta__<metric>__mode_<MODE>.png
-      * box_<metric>__<SET>__mode_<MODE>__FLAG.png
-      * heatmap_score_corr__<SET>__mode_<MODE>.png
-      * heatmap_protein_corr__<SET>__mode_<MODE>.png
-  - SUMMARY_STATS.md
-
-Defaults: subseq 5..15, fragment k=2..7, charges 1/2/3, ±30 ppm, RT ±1 min on a 20 min column.
+Author: you
 """
 
-import os, argparse, re, datetime, json, math
-from typing import List, Dict, Tuple, Optional
-import numpy as np
+import os, sys, math, argparse, datetime, random, re, bisect, json
+from typing import List, Dict, Optional, Iterable, Tuple
+from dataclasses import dataclass, field
+
 import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ---- Plot style ----
-plt.rcParams.update({
-    "figure.dpi": 200, "savefig.dpi": 200, "figure.figsize": (8.5, 5.4),
-    "font.size": 12, "axes.titlesize": 12, "axes.labelsize": 11,
-    "xtick.labelsize": 9, "ytick.labelsize": 9,
-})
-
-def add_grid(ax):
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-
-# ---- tqdm optional ----
+# ---------- tqdm ----------
 try:
     from tqdm.auto import tqdm
 except Exception:
     def tqdm(it, **kwargs): return it
 
-# ---- Mass constants (monoisotopic) ----
-PROTON_MASS = 1.007276466812
-WATER_MASS = 18.010564684
-MASS = {
-    "A": 71.037113805, "R": 156.101111050, "N": 114.042927470, "D": 115.026943065,
-    "C": 103.009184505, "E": 129.042593135, "Q": 128.058577540, "G": 57.021463735,
-    "H": 137.058911875, "I": 113.084064015, "L": 113.084064015, "K": 128.094963050,
-    "M": 131.040484645, "F": 147.068413945, "P": 97.052763875, "S": 87.032028435,
-    "T": 101.047678505, "W": 186.079312980, "Y": 163.063328575, "V": 99.068413945,
-    "U": 150.953633405
+# ---------- Banner ----------
+def banner(name: str = "WIQD SETS (alone, S1‑aligned + score)", title: str = "What Is Qing Doing?", args=None):
+    w=82; bar="+"+"="*(w-2)+"+"
+    def c(s): return f"|{s:^{w-2}}|"
+    print("\n".join([bar,c(title),c(f"({name})"),bar]))
+    if args:
+        keys = ["input_csv","outdir","sets","download_sets","sets_fasta_dir","sets_accessions_json",
+                "ppm_tol","charges","full_mz_len_min","full_mz_len_max","fragment_kmin","fragment_kmax",
+                "rt_tolerance_min","gradient_min","require_precursor_match_for_fragment","cys_mod",
+                "alpha","summary_top_n","min_nnz_topn","xle_collapse","split_keratin",
+                "score_prec_ppm_good","score_prec_ppm_max","score_frag_types_req"]
+        print("Args:", " | ".join(f"{k}={getattr(args,k)}" for k in keys if hasattr(args,k)))
+    print()
+
+# ---------- Matplotlib defaults ----------
+plt.rcParams.update({
+    "figure.dpi": 200, "savefig.dpi": 200, "figure.figsize": (6.8, 4.4),
+    "font.size": 12, "axes.titlesize": 12, "axes.labelsize": 11,
+    "xtick.labelsize": 9, "ytick.labelsize": 9
+})
+def _grid(ax): ax.grid(True, ls="--", lw=0.5, alpha=0.5)
+
+# ---------- Chemistry ----------
+AA = set("ACDEFGHIKLMNPQRSTVWY")
+MONO = {
+    "A": 71.037113805,"R":156.10111105,"N":114.04292747,"D":115.026943065,
+    "C":103.009184505,"E":129.042593135,"Q":128.05857754,"G":57.021463735,
+    "H":137.058911875,"I":113.084064015,"L":113.084064015,"K":128.09496305,
+    "M":131.040484645,"F":147.068413945,"P":97.052763875,"S":87.032028435,
+    "T":101.047678505,"W":186.07931298,"Y":163.063328575,"V":99.068413945,
 }
+H2O = 18.010564684
+PROTON = 1.007276466812
 
-# ---- Base/common accessions ----
-COMMON_ACCESSIONS = [
-    "P60709","P04406","P07437","P11142","P08238","P68104","P05388","P62805",
-    "P11021","P14625","P27824","P27797","P07237","P30101","Q15084","Q15061","Q9BS26",
-    "P02768","P01857","P01859","P01860","P01861","P01876","P01877","P01871","P04229",
-    "P01854","P01834","P0DOY2"
-]
+def clean_pep(p): return "".join(ch for ch in str(p).strip().upper() if ch in AA)
+def neutral_mass(seq, cys_fixed_mod: float=0.0): return sum(MONO[a] for a in seq) + H2O + cys_fixed_mod*seq.count("C")
+def mz_from_mass(m, z): return (m + z*PROTON)/z
+def ppm_diff(a: float, b: float) -> float: return (abs(a-b)/a*1e6) if a>0 else float("inf")
 
-# ---- Default sets (by accession) ----
-DEFAULT_SETS = {
-    "albumin": ["P02768"],
-    "antibody": ["P01857","P01859","P01860","P01861","P01876","P01877","P01871","P01834","P0DOY2"],
-    "keratin": ["P04264","P02533","P04259","P02538","P05787","P05783","P08727","Q04695","P35908","P35527"],
-    # serum without albumin
-    "serum": ["P02647","P02652","P02649","P02787","P02671","P02675","P02679","P01009","P68871","P69905"],
-    "cytoskeleton": ["P60709","P68104","P07437","P68371","Q71U36","Q9BQE3"],
-    "chaperone": ["P11142","P07900","P08238","P10809","P38646"]
-}
+def collapse_xle(s: str) -> str:
+    # Script‑1 behavior for sequence containment: I/L -> J
+    return "".join(("J" if c in ("I","L") else c) for c in s)
 
-# ---- FASTA helpers ----
-def parse_fasta(text: str) -> Dict[str, str]:
-    seqs = {}
-    hdr=None; buf=[]
-    for line in text.splitlines():
-        if not line: continue
-        if line[0] == ">":
-            if hdr:
-                seqs[hdr] = "".join(buf).replace(" ", "").upper()
-            hdr = line[1:].strip()
-            buf = []
+def frag_b_mz(seq: str, z: int, cys_fixed_mod: float) -> float:
+    return (neutral_mass(seq, cys_fixed_mod) - H2O + z*PROTON) / z
+
+def frag_y_mz(seq: str, z: int, cys_fixed_mod: float) -> float:
+    return (neutral_mass(seq, cys_fixed_mod) + z*PROTON) / z
+
+def within_ppm_lists(x: float, sorted_list: List[float], ppm_tol: float) -> bool:
+    if not sorted_list: return False
+    tol = x * ppm_tol * 1e-6
+    i = bisect.bisect_left(sorted_list, x)
+    if i < len(sorted_list) and abs(sorted_list[i]-x) <= tol: return True
+    if i>0 and abs(sorted_list[i-1]-x) <= tol: return True
+    if i+1<len(sorted_list) and abs(sorted_list[i+1]-x) <= tol: return True
+    return False
+
+def within_ppm_array(x: float, arr_sorted: List[float], ppm_tol: float) -> bool:
+    if not arr_sorted: return False
+    tol = x * ppm_tol * 1e-6
+    lo, hi = x - tol, x + tol
+    L = bisect.bisect_left(arr_sorted, lo)
+    R = bisect.bisect_right(arr_sorted, hi)
+    return R > L
+
+# ---------- RT surrogate ----------
+def predict_rt_min(seq: str, gradient_min: float=20.0) -> float:
+    if not seq: return float("nan")
+    kd = {"A":1.8,"R":-4.5,"N":-3.5,"D":-3.5,"C":2.5,"Q":-3.5,"E":-3.5,"G":-0.4,"H":-3.2,"I":4.5,"L":3.8,"K":-3.9,"M":1.9,"F":2.8,"P":-1.6,"S":-0.8,"T":-0.7,"W":-0.9,"Y":-1.3,"V":4.2}
+    gravy = sum(kd[a] for a in seq)/len(seq)
+    frac = (gravy + 4.5)/9.0
+    base = 0.5 + (gradient_min-1.0)*min(1.0, max(0.0, frac))
+    length_adj = 0.03*max(0,len(seq)-8)*(gradient_min/20.0)
+    basic_adj  = -0.15*(seq.count("K")+seq.count("R")+0.3*seq.count("H"))*(gradient_min/20.0)
+    return float(min(max(0.0, base+length_adj+basic_adj), gradient_min))
+
+# ---------- FASTA helpers ----------
+def parse_fasta(text: str) -> Dict[str,str]:
+    seqs={}; hdr=None; buf=[]
+    for ln in text.splitlines():
+        if not ln: continue
+        if ln[0]==">":
+            if hdr: seqs[hdr]="".join(buf).replace(" ","").upper()
+            hdr = ln[1:].strip(); buf=[]
         else:
-            buf.append(line.strip())
-    if hdr: seqs[hdr] = "".join(buf).replace(" ", "").upper()
+            buf.append(ln.strip())
+    if hdr: seqs[hdr]="".join(buf).replace(" ","").upper()
     return seqs
 
-def open_maybe_gzip(path: str):
-    import gzip
-    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "rt")
+def extract_accession(hdr: str) -> str:
+    m = re.match(r"^\w+\|([^|]+)\|", hdr)
+    if m: return m.group(1)
+    tok = hdr.split()[0]
+    if "|" in tok:
+        parts = tok.split("|")
+        for p in parts:
+            if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9]$", p) or re.match(r"^[A-NR-Z][0-9][A-Z0-9]{3}[0-9]$", p):
+                return p
+    return re.sub(r"[^A-Za-z0-9._-]+","_", tok)
 
-def extract_accession(header: str) -> str:
-    m = re.match(r"^\w+\|([^|]+)\|", header)
-    return m.group(1) if m else header.split()[0]
-
-def short_name(hdr: str) -> str:
-    m = re.match(r"^\w+\|([^|]+)\|([^ ]+)", hdr)
-    return m.group(2) if m else hdr.split()[0]
-
-# ---- Protein loading ----
-def load_common_proteins(prot_fasta: Optional[str], download_common: bool, accessions_path: Optional[str]) -> Dict[str, str]:
-    seqs = {}
-    if prot_fasta and os.path.isfile(prot_fasta):
-        with open_maybe_gzip(prot_fasta) as fh:
-            return parse_fasta(fh.read())
-    accs = []
-    if accessions_path and os.path.isfile(accessions_path):
-        with open(accessions_path, "r") as f:
-            for line in f:
-                t=line.strip()
-                if t and not t.startswith("#"): accs.append(t.split()[0])
-    else:
-        accs = list(dict.fromkeys(COMMON_ACCESSIONS))
-    if download_common:
-        try:
-            import requests
-            url = "https://rest.uniprot.org/uniprotkb/stream"
-            query = " OR ".join(f"accession:{a}" for a in accs)
-            params = {"query": query, "format": "fasta", "includeIsoform": "false"}
-            print("[sets-chained] downloading base/common proteins via UniProt REST ...")
-            r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
-            seqs = parse_fasta(r.text)
-        except Exception as e:
-            print(f"[sets-chained] WARNING: download_common failed ({e}); using embedded fallback.")
-    if not seqs:
-        # Minimal embedded fallback (HSPA8)
-        seqs = {"sp|P11142|HSP7C_HUMAN": (
-            "MSKGPAVGIDLGTTYSCVGVFQHGKVEIIANDQGNRTTPSYVAFTDTERLIGDAAKNQVA"
-            "MNPTNTVFDAKRLIGRRFDDAVVQSDMKHWPFMVVNDAGRPKVQVEYKGETKSFYPEEVS"
-            "SMVLTKMKEIAEAYLGKTVTNAVVTVPAYFNDSQRQATKDAGTIAGLNVLRIINEPTAAA"
-            "IAYGLDKKVGAERNVLIFDLGGGTFDVSILTIEDGIFEVKSTAGDTHLGGEDFDNRMVNH"
-            "FIAEFKRKHKKDISENKRAVRRLRTACERAKRTLSSSTQASIEIDSLYEGIDFYTSITRA"
-            "RFEELNADLFRGTLDPVEKALRDAKLDKSQIHDIVLVGGSTRIPKIQKLLQDFFNGKELN"
-            "KSINPDEAVAYGAAVQAAILSGDKSENVQDLLLLDVTPLSLGIETAGGVMTVLIKRNTTI"
-            "PTKQTQTFTTYSDNQPGVLIQVYEGERAMTKDNNLLGKFELTGIPPAPRGVPQIEVTFDI"
-            "DANGILNVSAVDKSTGKENKITITNDKGRLSKEDIERMVQEAEKYKAEDEKQRDKVSSKN"
-            "SLESYAFNMKATVEDEKLQGKINDEDKQKILDKCNEIINWLDKNQTAEKEEFEHQQKELE"
-            "KVCNPIITKLYQSAGGMPGGMPGGFPGGGAPPSGGASSGPTIEEVD"
-        )}
-    return seqs
-
-def download_uniprot_by_accessions(accessions: List[str]) -> Dict[str, str]:
+def fetch_uniprot_fasta_for_accessions(accs: List[str], timeout: float=45.0) -> Dict[str,str]:
+    if not accs: return {}
     try:
         import requests
         url = "https://rest.uniprot.org/uniprotkb/stream"
-        query = " OR ".join(f"accession:{a}" for a in accessions)
-        params = {"query": query, "format": "fasta", "includeIsoform": "false"}
-        r = requests.get(url, params=params, timeout=30)
+        q = " OR ".join(f"accession:{a}" for a in accs)
+        params = {"query": q, "format": "fasta", "includeIsoform": "false"}
+        r = requests.get(url, params=params, timeout=timeout)
         r.raise_for_status()
-        return parse_fasta(r.text)
+        hdr_to_seq = parse_fasta(r.text)
+        acc_to_seq = {}
+        for hdr, seq in hdr_to_seq.items():
+            acc_to_seq[extract_accession(hdr)] = seq
+        return acc_to_seq
     except Exception as e:
-        print(f"[sets-chained] WARNING: UniProt download failed for set accessions ({e}).")
+        print(f"[wiqd][WARN] UniProt fetch failed for {len(accs)} accs: {e}")
         return {}
 
-def select_seqs_by_accessions(seqs: Dict[str,str], accessions: List[str]) -> Dict[str,str]:
-    accset = set(accessions)
-    return {hdr: s for hdr, s in seqs.items() if extract_accession(hdr) in accset}
+# ---------- Window model ----------
+@dataclass
+class Window:
+    seq: str
+    length: int
+    mass: float
+    mz_by_z: Dict[int,float]
+    rt_min: float
+    frag_mz_sorted: List[float] = field(default_factory=list)  # b/y-only per window
 
-def merge_seqs(a: Dict[str,str], b: Dict[str,str]) -> Dict[str,str]:
-    out = dict(a); out.update(b); return out
+def build_windows_index_for_sequences(
+    sequences: List[str], len_min: int, len_max: int, charges: Iterable[int],
+    gradient_min: float, cys_fixed_mod: float
+) -> List[Window]:
+    zs = sorted(set(int(z) for z in charges))
+    out: List[Window] = []
+    for s in sequences:
+        clean = "".join(ch for ch in s if ch.isalpha()).upper()
+        if not clean: continue
+        N = len(clean)
+        for L in range(max(1,len_min), min(N, len_max)+1):
+            for i in range(0, N-L+1):
+                sub = clean[i:i+L]
+                if not set(sub) <= AA: continue
+                m = neutral_mass(sub, cys_fixed_mod)
+                mz_by = {z: mz_from_mass(m, z) for z in zs}
+                rt = predict_rt_min(sub, gradient_min)
+                out.append(Window(seq=sub, length=L, mass=m, mz_by_z=mz_by, rt_min=rt))
+    return out
 
-def safe_slug(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", s.strip().lower()).strip("_")
+def index_fragments_for_windows(
+    windows: List[Window],
+    fragment_kmin: int, fragment_kmax: int,
+    charges: Iterable[int], cys_fixed_mod: float
+) -> List[float]:
+    """Populate each Window.frag_mz_sorted with b/y-only fragment m/z and return a global ANY-window sorted list."""
+    frag_all: List[float] = []
+    for w in windows:
+        arr: List[float] = []
+        kmax_eff = max(fragment_kmin, min(fragment_kmax, w.length - 1))
+        if kmax_eff >= fragment_kmin:
+            for k in range(fragment_kmin, kmax_eff + 1):
+                bseq = w.seq[:k]
+                yseq = w.seq[-k:]
+                for z in charges:
+                    arr.append(frag_b_mz(bseq, z, cys_fixed_mod))
+                    arr.append(frag_y_mz(yseq, z, cys_fixed_mod))
+        arr.sort()
+        w.frag_mz_sorted = arr
+        frag_all.extend(arr)
+    frag_all.sort()
+    return frag_all
 
-# ---- Chemistry helpers ----
-def calc_mass(seq: str) -> float:
-    m = 0.0
-    for a in seq:
-        if a not in MASS: return float("nan")
-        m += MASS[a]
-    return m + WATER_MASS
+# ---------- Matching primitives (Script‑2 originals) ----------
+def peptide_fragment_mz_cache(pep: str, charges: Iterable[int], cys_fixed_mod: float, kmin: int, kmax: int):
+    Lp=len(pep); kmin=max(1,int(kmin)); kmax=min(int(kmax), Lp)
+    mz_by_z: Dict[int,List[float]] = {int(z): [] for z in charges}
+    for k in range(kmin, kmax+1):
+        for i in range(0, Lp-k+1):
+            sub = pep[i:i+k]
+            m = neutral_mass(sub, cys_fixed_mod)
+            for z in list(mz_by_z.keys()):
+                mz_by_z[z].append(mz_from_mass(m, z))
+    for z in list(mz_by_z.keys()):
+        mz_by_z[z].sort()
+    return {"mz_by_z": mz_by_z, "kmin": kmin, "kmax": kmax}
 
-def mz_from_mass(neutral_mass: float, z: int) -> float:
-    return (neutral_mass + z*PROTON_MASS)/z
+def filter_rt_idxs(idx_list: List[int], windows: List[Window], rt: float, tol_min: float) -> List[int]:
+    lo, hi = rt - tol_min, rt + tol_min
+    return [i for i in idx_list if (windows[i].rt_min >= lo and windows[i].rt_min <= hi)]
 
-def ppm_window_mz(center_mz: float, ppm: float) -> Tuple[float,float]:
-    delta = center_mz * ppm * 1e-6
-    return center_mz - delta, center_mz + delta
+def filter_rt(windows: List[Window], rt: float, tol_min: float) -> List[Window]:
+    if not (windows and (rt==rt)): return []
+    lo, hi = rt - tol_min, rt + tol_min
+    return [w for w in windows if (w.rt_min >= lo and w.rt_min <= hi)]
 
-def collapse_xle(s: str) -> str:
-    return "".join("J" if c in ("L","I") else c for c in s)
+def count_precursor_matches(windows: List[Window], pep_mz_by_z: Dict[int,float], ppm_tol: float) -> Tuple[int,int]:
+    matches=0; candidates=len(windows)
+    for w in windows:
+        hit=False
+        for z, pmz in pep_mz_by_z.items():
+            wmz = w.mz_by_z.get(z)
+            if wmz is None: continue
+            if ppm_diff(pmz, wmz) <= ppm_tol:
+                hit=True; break
+        if hit: matches+=1
+    return matches, candidates
 
-# ---- Fragment m/z helpers ----
-def frag_b_mz(seq: str, z: int) -> float:
-    # b-ion: peptide mass without water + z*H divided by z
-    return (calc_mass(seq) - WATER_MASS + z*PROTON_MASS) / z
+def best_precursor_error(windows: List[Window], pep_mz_by_z: Dict[int,float]) -> Dict[str,Optional[float]]:
+    best = {"ppm": float("inf"), "da": float("inf"), "best_charge": None, "best_length": None}
+    for w in windows:
+        for z, pmz in pep_mz_by_z.items():
+            wmz = w.mz_by_z.get(z)
+            if wmz is None: continue
+            da = abs(wmz - pmz)
+            ppmv = (da/pmz)*1e6
+            if ppmv < best["ppm"]:
+                best.update({"ppm": ppmv, "da": da, "best_charge": z, "best_length": w.length})
+    return best
 
-def frag_y_mz(seq: str, z: int) -> float:
-    # y-ion: peptide mass (includes water) + z*H divided by z
-    return (calc_mass(seq) + z*PROTON_MASS) / z
+def fragment_any_mz_match_counts(
+    windows: List[Window], pep_frag_cache: dict, ppm_tol: float, cys_fixed_mod: float,
+    kmin: int, kmax: int
+) -> Tuple[int,int]:
+    cand=0; mz_match=0
+    mz_lists_by_z = pep_frag_cache["mz_by_z"]
+    for w in windows:
+        kmax_w = min(kmax, w.length)
+        for k in range(kmin, kmax_w+1):
+            for i in range(0, w.length-k+1):
+                sub = w.seq[i:i+k]
+                m = neutral_mass(sub, cys_fixed_mod)
+                cand += 1
+                hit=False
+                for z, mz_list in mz_lists_by_z.items():
+                    mzv = mz_from_mass(m, z)
+                    if within_ppm_lists(mzv, mz_list, ppm_tol):
+                        hit=True; break
+                if hit: mz_match += 1
+    return mz_match, cand
 
-# ---- RT model (simple KD-based, scaled to column length) ----
-KD = {
-    "I": 4.5,"V": 4.2,"L": 3.8,"F": 2.8,"C": 2.5,"M": 1.9,"A": 1.8,"G": -0.4,"T": -0.7,"S": -0.8,
-    "W": -0.9,"Y": -1.3,"P": -1.6,"H": -3.2,"E": -3.5,"Q": -3.5,"D": -3.5,"N": -3.5,"K": -3.9,"R": -4.5,"U": 0.0
-}
-HYDRO = set(list("AVILMWFY"))
+def ppm_to_score(ppm_val: float, ppm_tol: float) -> float:
+    if not (isinstance(ppm_val,float) and ppm_val==ppm_val): return 0.0
+    return max(0.0, 1.0 - min(ppm_val, ppm_tol)/ppm_tol)
 
-def rt_raw_score(seq: str) -> float:
-    if not seq: return 0.0
-    vals = [KD.get(a, 0.0) for a in seq]
-    mean_kd = float(np.mean(vals)) if vals else 0.0
-    frac_hyd = sum(a in HYDRO for a in seq)/max(1,len(seq))
-    return mean_kd + 0.5*frac_hyd
-
-def map_to_minutes(raw_vals: np.ndarray, rt_total_min: float) -> np.ndarray:
-    if raw_vals.size == 0: return raw_vals
-    vmin = float(np.min(raw_vals)); vmax = float(np.max(raw_vals))
-    if math.isclose(vmin, vmax): return np.full_like(raw_vals, rt_total_min/2.0)
-    return (raw_vals - vmin) / (vmax - vmin) * rt_total_min
-
-# ---- Window and fragment indices ----
-def build_window_index(seqs: Dict[str,str], kmin: int, kmax: int) -> pd.DataFrame:
-    rows = []
-    for hdr, seq in tqdm(seqs.items(), desc="[sets-chained] indexing protein windows"):
-        clean = "".join(c for c in seq if c.isalpha()).upper()
-        L = len(clean)
-        if L == 0: continue
-        for k in range(kmin, kmax+1):
-            if L < k: continue
-            for start in range(0, L-k+1):
-                window = clean[start:start+k]
-                if any(ch not in MASS for ch in window): continue
-                rows.append({
-                    "protein": hdr,
-                    "accession": extract_accession(hdr),
-                    "protein_short": short_name(hdr),
-                    "start": start,
-                    "length": k,
-                    "window": window,
-                    "mass": calc_mass(window),
-                    "rt_raw": rt_raw_score(window),
-                })
-    df = pd.DataFrame(rows)
-    if df.empty: return df
-    df.sort_values("mass", inplace=True, kind="mergesort")
-    df.reset_index(drop=True, inplace=True)
-    return df
-
-def build_fragment_index(win_df: pd.DataFrame, frag_kmin: int, frag_kmax: int, frag_charges: List[int]) -> pd.DataFrame:
-    idx_rows = []
-    for widx, wr in tqdm(win_df.iterrows(), total=len(win_df), desc="[sets-chained] indexing window fragments"):
-        wseq = wr["window"]; Lw = len(wseq)
-        for k in range(frag_kmin, min(frag_kmax, Lw-1)+1):
-            # b_k
-            subseq_b = wseq[:k]
-            for z in frag_charges:
-                idx_rows.append({"frag_mz": frag_b_mz(subseq_b, z), "ion": "b", "k": k, "z": z,
-                                 "window_idx": int(widx), "rt_raw": wr["rt_raw"]})
-            # y_k
-            subseq_y = wseq[-k:]
-            for z in frag_charges:
-                idx_rows.append({"frag_mz": frag_y_mz(subseq_y, z), "ion": "y", "k": k, "z": z,
-                                 "window_idx": int(widx), "rt_raw": wr["rt_raw"]})
-    frag_df = pd.DataFrame(idx_rows)
-    if frag_df.empty: return frag_df
-    frag_df.sort_values("frag_mz", inplace=True, kind="mergesort")
-    frag_df.reset_index(drop=True, inplace=True)
-    return frag_df
-
-# ---- Effect size (Cliff's δ) ----
-def mannwhitney_auc_cliffs(x_hit: pd.Series, x_non: pd.Series):
-    x = pd.to_numeric(x_hit, errors="coerce").fillna(0.0).to_numpy()
-    y = pd.to_numeric(x_non, errors="coerce").fillna(0.0).to_numpy()
-    n1, n2 = len(x), len(y)
-    if n1 == 0 or n2 == 0: return np.nan, np.nan
-    comb = np.concatenate([x, y])
-    ranks = pd.Series(comb).rank(method="average").to_numpy()
-    R1 = ranks[:n1].sum()
-    U1 = R1 - n1*(n1+1)/2.0
-    auc = U1 / (n1*n2)
-    delta = 2.0*auc - 1.0
-    return float(auc), float(delta)
-
-def classify_delta(delta: float) -> str:
-    if pd.isna(delta): return "NA"
-    a=abs(delta)
-    if a<0.147: return "negligible"
-    if a<0.33:  return "small"
-    if a<0.474: return "medium"
-    return "large"
-
-# ---- Matching primitives ----
-def binary_search_mass(masses_sorted: np.ndarray, mmin: float, mmax: float) -> Tuple[int,int]:
-    import bisect
-    left = bisect.bisect_left(masses_sorted, mmin)
-    right = bisect.bisect_right(masses_sorted, mmax)
-    return left, right
-
-def screen_precursor_pairs(peptides_df: pd.DataFrame, win_df: pd.DataFrame,
-                           charges: List[int], prec_ppm: float) -> Dict[str, set]:
+# ---------- Script‑1‑style helpers ----------
+def pep_b_y_fragments(pep: str, charges: Iterable[int], cys_fixed_mod: float,
+                      kmin: int, kmax: int, xle_collapse_flag: bool):
+    """Return (fr_mzs, fr_keys):
+       fr_mzs: list of (mz, ion, k, z) for peptide's b/y fragments
+       fr_keys: list of (ion, k, seq_c) for sequence containment checks
     """
-    Return mapping: pairs[pep] = set of window indices with ≥1 precursor m/z match (any allowed z).
-    """
-    pairs = {pep: set() for pep in peptides_df["peptide"]}
-    masses_sorted = win_df["mass"].values
-    for _, r in tqdm(peptides_df.iterrows(), total=len(peptides_df), desc="[sets-chained] precursor m/z matching"):
-        pep = r["peptide"]; pmass = r["mass"]
+    L = len(pep)
+    kmax_eff = max(kmin, min(kmax, L - 1))
+    fr_mzs = []
+    fr_keys = []
+    for k in range(kmin, kmax_eff + 1):
+        bseq = pep[:k]
+        yseq = pep[-k:]
+        bseq_c = collapse_xle(bseq) if xle_collapse_flag else bseq
+        yseq_c = collapse_xle(yseq) if xle_collapse_flag else yseq
+        fr_keys.append(("b", k, bseq_c))
+        fr_keys.append(("y", k, yseq_c))
         for z in charges:
-            q_mz = mz_from_mass(pmass, z)
-            mzmin, mzmax = ppm_window_mz(q_mz, prec_ppm)
-            mmin = z*mzmin - z*PROTON_MASS
-            mmax = z*mzmax - z*PROTON_MASS
-            left, right = binary_search_mass(masses_sorted, min(mmin,mmax), max(mmin,mmax))
-            if right <= left: 
-                continue
-            idxs = win_df.index.values[left:right]
-            pairs[pep].update(idxs.tolist())
-    return pairs
+            fr_mzs.append((frag_b_mz(bseq, z, cys_fixed_mod), "b", k, z))
+            fr_mzs.append((frag_y_mz(yseq, z, cys_fixed_mod), "y", k, z))
+    return fr_mzs, fr_keys
 
-# ---- Core per-set×mode computation ----
-def compute_per_peptide_metrics_for_set(
-    set_name: str, mode: str,
-    df_peptides: pd.DataFrame,
-    base_seqs: Dict[str,str], set_seqs: Dict[str,str],
-    kmin_subseq: int, kmax_subseq: int,
-    charges: List[int], prec_ppm: float,
-    frag_kmin: int, frag_kmax: int, frag_charges: List[int], frag_ppm: float,
-    rt_total_min: float, rt_tol: float,
-    xle_collapse: bool = False,
-    prot_corr_top: int = 30
+def precursor_matched_window_indices(
+    windows: List[Window], pep_mz_by_z: Dict[int,float], ppm_tol: float
+) -> set:
+    hits = set()
+    for i, w in enumerate(windows):
+        ok = False
+        for z, pmz in pep_mz_by_z.items():
+            wmz = w.mz_by_z.get(z)
+            if wmz is None: continue
+            if ppm_diff(pmz, wmz) <= ppm_tol:
+                ok = True; break
+        if ok:
+            hits.add(i)
+    return hits
+
+def count_fragment_types_over_window_subset(
+    window_idxs: set, windows: List[Window],
+    fr_mzs: list, ppm_tol: float
+) -> int:
+    """Return #unique (ion,k,z) types matched in the given window subset (ppm)."""
+    if not window_idxs or not fr_mzs: return 0
+    import bisect
+    seen = set()
+    for (mz, ion, k, z) in fr_mzs:
+        lo = mz * (1 - ppm_tol*1e-6); hi = mz * (1 + ppm_tol*1e-6)
+        hit = False
+        for widx in window_idxs:
+            arr = windows[widx].frag_mz_sorted
+            if not arr: continue
+            L = bisect.bisect_left(arr, lo)
+            R = bisect.bisect_right(arr, hi)
+            if R > L: hit = True; break
+        if hit:
+            seen.add((ion, k, z))
+    return len(seen)
+
+# ---------- NEW: Contamination score ----------
+def contamination_score(
+    windows: List[Window],
+    pep_mz_by_z: Dict[int,float],
+    fr_mzs: list,
+    # pools are lists of indices into windows
+    prec_pool_idxs: List[int],
+    rt_pool_idxs: List[int],
+    good_ppm: float,
+    max_ppm: float,
+    frag_types_req: int,
+) -> Dict[str, float]:
+    """Return {contam_score, contam_score_rt} in [0,1]. Mostly 0; near 1 with strong chained evidence."""
+    def best_ppm_over_idx(idx_list):
+        best = float("inf")
+        for i in idx_list:
+            w = windows[i]
+            for z, pmz in pep_mz_by_z.items():
+                wmz = w.mz_by_z.get(z)
+                if wmz is None: continue
+                best = min(best, (abs(wmz - pmz)/pmz)*1e6)
+        return best
+
+    def score_for_pool(pool_idxs):
+        if not pool_idxs: return 0.0
+        # precursor windows within thresholds
+        wpool = [windows[i] for i in pool_idxs]
+        prec20 = precursor_matched_window_indices(wpool, pep_mz_by_z, good_ppm)
+        prec30 = precursor_matched_window_indices(wpool, pep_mz_by_z, max_ppm)
+        has_prec20 = len(prec20) > 0
+        has_prec30 = len(prec30) > 0
+        if not has_prec30:
+            return 0.0
+        # chained fragments within thresholds
+        m20 = count_fragment_types_over_window_subset({pool_idxs[i] for i in prec20}, windows, fr_mzs, good_ppm) if has_prec20 else 0
+        m30 = count_fragment_types_over_window_subset({pool_idxs[i] for i in prec30}, windows, fr_mzs, max_ppm)
+        # exact 1.0 condition
+        if has_prec20 and m20 >= frag_types_req:
+            return 1.0
+        # otherwise interpolate
+        best_ppm = best_ppm_over_idx(pool_idxs)
+        prec_lin = 1.0 if best_ppm <= good_ppm else (0.0 if best_ppm >= max_ppm else (max_ppm - best_ppm)/(max_ppm - good_ppm))
+        # fragment quality: prefer 20ppm matches but allow 30ppm evidence to contribute
+        frag_lin_20 = min(1.0, m20/frag_types_req) if frag_types_req>0 else 0.0
+        frag_lin_30 = min(1.0, m30/frag_types_req) if frag_types_req>0 else 0.0
+        frag_lin = 0.7*frag_lin_20 + 0.3*frag_lin_30  # weight precise fragments more
+        return float(max(0.0, min(1.0, prec_lin * frag_lin)))
+
+    # Build deterministic pools
+    prec_pool_idxs = list(sorted(set(prec_pool_idxs)))
+    rt_pool_idxs   = list(sorted(set(rt_pool_idxs)))
+    return {
+        "contam_score":    score_for_pool(prec_pool_idxs),
+        "contam_score_rt": score_for_pool(rt_pool_idxs)
+    }
+
+# ---------- Script‑1‑style per‑set metrics (+ score) ----------
+def compute_set_metrics_script1_like(
+    pep: str,
+    windows_all: List[Window],
+    frag_any_sorted: List[float],
+    full_len_min: int, full_len_max: int,
+    rt_pred_min: float, rt_tol_min: float,
+    charges: Iterable[int], pep_mz_by_z: Dict[int,float],
+    ppm_tol: float,
+    cys_fixed_mod: float,
+    fragment_kmin: int, fragment_kmax: int,
+    xle_collapse_flag: bool,
+    # score tunables
+    good_ppm: float, max_ppm: float, frag_types_req: int,
 ):
+    # Precursor candidate windows by length
+    prec_pool_idx = [i for i,w in enumerate(windows_all) if full_len_min <= w.length <= full_len_max]
+    if not prec_pool_idx:
+        out = {k: 0.0 for k in [
+            "N_precursor_mz","N_precursor_mz_rt","N_fragment_mz_any","Frac_fragment_mz_any",
+            "N_fragment_mz_rt","Frac_fragment_mz_rt","N_fragment_mz_given_precursor","Frac_fragment_mz_given_precursor",
+            "N_fragment_mz_given_precursor_rt","Frac_fragment_mz_given_precursor_rt","N_fragment_sequence_given_precursor",
+            "Frac_fragment_sequence_given_precursor","N_fragment_sequence_given_precursor_rt","Frac_fragment_sequence_given_precursor_rt",
+        ]}
+        out.update({"contam_score":0.0,"contam_score_rt":0.0,"best_ppm":float("inf"),"best_ppm_rt":float("inf")})
+        return out
+
+    # RT-gated pool
+    rt_pool_idx = filter_rt_idxs(prec_pool_idx, windows_all, rt_pred_min, rt_tol_min)
+
+    # Precursor-matched windows (30ppm baseline for counts)
+    matched_rel = precursor_matched_window_indices([windows_all[i] for i in prec_pool_idx], pep_mz_by_z, ppm_tol)
+    matched_win_idxs = {prec_pool_idx[i] for i in matched_rel}
+    matched_rt_rel = precursor_matched_window_indices([windows_all[i] for i in rt_pool_idx], pep_mz_by_z, ppm_tol)
+    matched_win_idxs_rt = {rt_pool_idx[i] for i in matched_rt_rel}
+
+    N_precursor_mz = float(len(matched_win_idxs))
+    N_precursor_mz_rt = float(len(matched_win_idxs_rt))
+
+    # Peptide b/y fragments
+    fr_mzs, fr_keys = pep_b_y_fragments(pep, charges, cys_fixed_mod, fragment_kmin, fragment_kmax, xle_collapse_flag)
+    n_types = float(len(fr_mzs)) if fr_mzs else 1.0
+
+    # ANY-window (global) fragment matches (ungated)
+    seen_any = set()
+    for (mz, ion, k, z) in fr_mzs:
+        if within_ppm_array(mz, frag_any_sorted, ppm_tol):
+            seen_any.add((ion,k,z))
+    N_fragment_mz_any = float(len(seen_any))
+    Frac_fragment_mz_any = N_fragment_mz_any / n_types
+
+    # ANY-window RT-gated
+    frag_rt_all: List[float] = []
+    for i in range(len(windows_all)):
+        if abs(windows_all[i].rt_min - rt_pred_min) <= rt_tol_min:
+            frag_rt_all.extend(windows_all[i].frag_mz_sorted)
+    frag_rt_all.sort()
+    seen_rt = set()
+    for (mz, ion, k, z) in fr_mzs:
+        if within_ppm_array(mz, frag_rt_all, ppm_tol):
+            seen_rt.add((ion,k,z))
+    N_fragment_mz_rt = float(len(seen_rt))
+    Frac_fragment_mz_rt = N_fragment_mz_rt / n_types
+
+    # Chained fragment m/z
+    N_fragment_mz_given_precursor = float(count_fragment_types_over_window_subset(matched_win_idxs, windows_all, fr_mzs, ppm_tol))
+    Frac_fragment_mz_given_precursor = N_fragment_mz_given_precursor / n_types
+    N_fragment_mz_given_precursor_rt = float(count_fragment_types_over_window_subset(matched_win_idxs_rt, windows_all, fr_mzs, ppm_tol))
+    Frac_fragment_mz_given_precursor_rt = N_fragment_mz_given_precursor_rt / n_types
+
+    # Sequence containment among precursor‑matched windows
+    frag_seq_set = set(fr_keys)
+    def seq_c(s): return collapse_xle(s) if xle_collapse_flag else s
+    matched_seq = set()
+    for (ion,k,seqc) in frag_seq_set:
+        for widx in matched_win_idxs:
+            if seqc in seq_c(windows_all[widx].seq):
+                matched_seq.add((ion,k,seqc)); break
+    N_fragment_sequence_given_precursor = float(len(matched_seq))
+    Frac_fragment_sequence_given_precursor = N_fragment_sequence_given_precursor / max(1.0, float(len(frag_seq_set)))
+
+    matched_seq_rt = set()
+    for (ion,k,seqc) in frag_seq_set:
+        for widx in matched_win_idxs_rt:
+            if seqc in seq_c(windows_all[widx].seq):
+                matched_seq_rt.add((ion,k,seqc)); break
+    N_fragment_sequence_given_precursor_rt = float(len(matched_seq_rt))
+    Frac_fragment_sequence_given_precursor_rt = N_fragment_sequence_given_precursor_rt / max(1.0, float(len(frag_seq_set)))
+
+    # Best ppm (all windows; and RT‑gated)
+    best_all = best_precursor_error([windows_all[i] for i in prec_pool_idx], pep_mz_by_z)
+    best_rt  = best_precursor_error([windows_all[i] for i in rt_pool_idx],  pep_mz_by_z) if rt_pool_idx else {"ppm": float("inf")}
+
+    # NEW contamination score (±RT)
+    score_dict = contamination_score(
+        windows=windows_all,
+        pep_mz_by_z=pep_mz_by_z,
+        fr_mzs=fr_mzs,
+        prec_pool_idxs=prec_pool_idx,
+        rt_pool_idxs=rt_pool_idx,
+        good_ppm=good_ppm, max_ppm=max_ppm, frag_types_req=frag_types_req
+    )
+
+    out = {
+        "N_precursor_mz": N_precursor_mz,
+        "N_precursor_mz_rt": N_precursor_mz_rt,
+        "N_fragment_mz_any": N_fragment_mz_any,
+        "Frac_fragment_mz_any": Frac_fragment_mz_any,
+        "N_fragment_mz_rt": N_fragment_mz_rt,
+        "Frac_fragment_mz_rt": Frac_fragment_mz_rt,
+        "N_fragment_mz_given_precursor": N_fragment_mz_given_precursor,
+        "Frac_fragment_mz_given_precursor": Frac_fragment_mz_given_precursor,
+        "N_fragment_mz_given_precursor_rt": N_fragment_mz_given_precursor_rt,
+        "Frac_fragment_mz_given_precursor_rt": Frac_fragment_mz_given_precursor_rt,
+        "N_fragment_sequence_given_precursor": N_fragment_sequence_given_precursor,
+        "Frac_fragment_sequence_given_precursor": Frac_fragment_sequence_given_precursor,
+        "N_fragment_sequence_given_precursor_rt": N_fragment_sequence_given_precursor_rt,
+        "Frac_fragment_sequence_given_precursor_rt": Frac_fragment_sequence_given_precursor_rt,
+        "contam_score": score_dict["contam_score"],
+        "contam_score_rt": score_dict["contam_score_rt"],
+        "best_ppm": float(best_all["ppm"]),
+        "best_ppm_rt": float(best_rt["ppm"]),
+    }
+    return out
+
+# ---------- Default sets ----------
+DEFAULT_SETS: Dict[str, List[str]] = {
+    "actin_tubulin": ["P60709","P63261","Q71U36","P68363","P07437","P68371","P08670"],
+    "keratins": ["P04264","P35908","P35527","P13645","P05787","P05783","P02533","P08727","Q04695","P04259"],
+    "protease_autolysis": ["P00760","Q7M135"],
+    "immunoglobulins": ["P01857","P01859","P01860","P01861","P01876","P01877","P01871","P01834","P0DOY2"],
+    "transferrin": ["P02787"],
+    "hemoglobin": ["P69905","P68871"],
+    "apolipoproteins": ["P02647","P02652","P02649","P02654","P02655","P02656","P04114"],
+    "streptavidin_avidin_birA": ["P22629","P02701","P06709"],
+    "protein_A_G": ["P02976","P06654"],
+    "caseins_gelatin": ["P02662","P02666","P02668","P02452","P08123","P02461"],
+    "mhc_hardware": ["P61769","P04439","P01889","P10321"],
+    "albumin": ["P02768"],
+}
+SET_FRIENDLY = {
+    "actin_tubulin": "Actin/Tubulin (&c.)",
+    "keratins": "Keratins",
+    "protease_autolysis": "Protease autolysis (trypsin/Lys‑C)",
+    "immunoglobulins": "Immunoglobulins",
+    "transferrin": "Transferrin",
+    "hemoglobin": "Hemoglobin",
+    "apolipoproteins": "Apolipoproteins",
+    "streptavidin_avidin_birA": "Streptavidin/Avidin/BirA",
+    "protein_A_G": "Protein A/G",
+    "caseins_gelatin": "Caseins / gelatin",
+    "mhc_hardware": "MHC hardware (B2M/HLA)",
+    "albumin": "Albumin",
+}
+SET_HINTS = {
+    "keratins": "Skin/hair shed contamination; abundant tryptic peptides can steal MS/MS duty cycle.",
+    "protease_autolysis": "Protease autolysis series (trypsin/Lys‑C).",
+    "immunoglobulins": "Ig constant‑region peptides; trace blood or antibody reagents.",
+    "transferrin": "Serum/plasma carryover.",
+    "hemoglobin": "Red blood cell contamination; handling artifacts.",
+    "apolipoproteins": "Lipoprotein/serum background; plasma workflows.",
+    "streptavidin_avidin_birA": "Biotin workflows; streptavidin/avidin/BirA shedding.",
+    "protein_A_G": "Antibody capture resin leachates.",
+    "caseins_gelatin": "Milk/gelatin blocking reagents.",
+    "mhc_hardware": "β2‑microglobulin/HLA hardware shedding in immunopeptidomics.",
+    "actin_tubulin": "High‑abundance cytoskeleton; lysis/shear background.",
+    "albumin": "Dominant serum protein; common carryover/bleed‑through.",
+}
+
+# ---------- Load SET sequences ----------
+def load_set_sequences(set_name: str, args) -> Dict[str,str]:
     """
+    Returns a dict accession->sequence (upper AA letters only).
+    Priority:
+      1) --sets_fasta_dir/<set_name>.fasta
+      2) --sets_accessions_json (override DEFAULT_SETS)
+      3) DEFAULT_SETS via UniProt (if --download_sets)
+    """
+    acc_map = DEFAULT_SETS.copy()
+    if args.sets_accessions_json:
+        try:
+            with open(args.sets_accessions_json, "r") as fh:
+                user_map = json.load(fh)
+            for k,v in user_map.items():
+                if isinstance(v, list) and all(isinstance(x,str) for x in v):
+                    acc_map[k] = v
+        except Exception as e:
+            print(f"[sets][WARN] failed to read --sets_accessions_json: {e}")
+
+    # Option 1: local FASTA
+    if args.sets_fasta_dir:
+        fpath = os.path.join(args.sets_fasta_dir, f"{set_name}.fasta")
+        if os.path.isfile(fpath):
+            with open(fpath, "r") as fh:
+                hdr_to_seq = parse_fasta(fh.read())
+            acc_to_seq = {}
+            for hdr, seq in hdr_to_seq.items():
+                acc_to_seq[extract_accession(hdr)] = seq
+            if acc_to_seq:
+                print(f"[sets] {set_name}: loaded {len(acc_to_seq)} sequences from FASTA")
+                return acc_to_seq
+
+    # Option 2/3: accessions (download if requested)
+    accs = acc_map.get(set_name, [])
+    if args.download_sets and accs:
+        acc_to_seq = fetch_uniprot_fasta_for_accessions(accs)
+        if acc_to_seq:
+            print(f"[sets] {set_name}: fetched {len(acc_to_seq)} sequences from UniProt")
+            return acc_to_seq
+        else:
+            print(f"[sets][WARN] UniProt returned 0 sequences for {set_name}")
+
+    # No data
+    if not args.download_sets:
+        print(f"[sets][WARN] {set_name}: no FASTA and download disabled; skipping.")
+    return {}
+
+# ---------- Resolve overlaps & make sets disjoint ----------
+def resolve_disjoint_sets(seqs_by_set: Dict[str, Dict[str,str]], sets_order: List[str]):
+    """
+    Make sets disjoint by accession, then by exact sequence. Earlier sets win.
     Returns:
-      scores_rows: list of dicts per peptide with all metrics (see header)
-      per_protein_df: per-peptide per-protein precursor-match counts
+      resolved: {set: {acc: seq}}
+      overlap_matrix: pd.DataFrame of pre-dedup accession overlaps
+      report_lines: human-readable report
     """
-    # Sequences by mode
-    seqs = dict(set_seqs) if mode == "alone" else merge_seqs(base_seqs, set_seqs)
-    if not seqs: return [], pd.DataFrame()
+    # Accession overlap matrix (pre-dedup)
+    acc_sets = {s: set(d.keys()) for s, d in seqs_by_set.items()}
+    sets = [s for s in sets_order if s in acc_sets]
+    mat = pd.DataFrame(0, index=sets, columns=sets, dtype=int)
+    for i, si in enumerate(sets):
+        for sj in sets[i:]:
+            inter = len(acc_sets[si].intersection(acc_sets[sj]))
+            mat.loc[si, sj] = inter
+            mat.loc[sj, si] = inter
 
-    # Windows and fragments
-    win_df = build_window_index(seqs, kmin_subseq, kmax_subseq)
-    if win_df.empty: return [], pd.DataFrame()
-    frag_df = build_fragment_index(win_df, frag_kmin, frag_kmax, frag_charges)
+    # Resolve by accession then by exact sequence content
+    assigned_acc = {}
+    assigned_seq = {}
+    resolved = {s: {} for s in sets_order}
+    removed = {s: [] for s in sets_order}
+    for s in sets_order:
+        for acc, seq in seqs_by_set.get(s, {}).items():
+            if acc in assigned_acc:
+                removed[s].append(acc); continue
+            if seq in assigned_seq:
+                removed[s].append(acc); continue
+            assigned_acc[acc] = s
+            assigned_seq[seq] = s
+            resolved[s][acc] = seq
 
-    # Precursor matched window sets
-    pairs = screen_precursor_pairs(df_peptides, win_df, charges, prec_ppm)
+    # Report
+    lines = ["# Set overlap & resolution (disjoint sets)",
+             f"Sets (ordered): {', '.join(sets_order)}",
+             "Resolution rule: earlier set wins; duplicates by accession or exact sequence removed from later sets.",
+             ""]
+    for s in sets_order:
+        n0 = len(seqs_by_set.get(s, {}))
+        n_rm = len(removed.get(s, []))
+        n1 = len(resolved.get(s, {}))
+        lines.append(f"- {s}: original={n0}, removed={n_rm}, final={n1}")
+    return resolved, mat, lines
 
-    # Predict RT jointly for peptides and windows (shared scaling)
-    pep_rt_raw = df_peptides["peptide"].apply(rt_raw_score).values
-    all_rt_raw = np.concatenate([pep_rt_raw, win_df["rt_raw"].values])
-    all_rt_min = map_to_minutes(all_rt_raw, rt_total_min)
-    pep_rt_min = all_rt_min[:len(pep_rt_raw)]
-    win_rt_min = all_rt_min[len(pep_rt_raw):]
-    win_df = win_df.copy()
-    win_df["rt_min"] = win_rt_min
+# ---------- Stats ----------
+def mannwhitney_u_p(x, y):
+    n1, n2 = len(x), len(y)
+    if n1==0 or n2==0: return (float("nan"), float("nan"))
+    combined = x+y
+    if min(combined)==max(combined): return (float("nan"), float("nan"))
+    data = [(v,0) for v in x] + [(v,1) for v in y]; data.sort(key=lambda t:t[0])
+    R=[0.0]*(n1+n2); i=0
+    while i<len(data):
+        j=i
+        while j<len(data) and data[j][0]==data[i][0]: j+=1
+        rank=(i+1+j)/2.0
+        for k in range(i,j): R[k]=rank
+        i=j
+    R1=sum(R[:n1]); U1=R1 - n1*(n1+1)/2.0; U2=n1*n2 - U1; U=min(U1,U2)
+    i=0; T=0
+    while i<len(data):
+        j=i
+        while j<len(data) and data[j][0]==data[i][0]: j+=1
+        t=j-i
+        if t>1: T += t*(t*t-1)
+        i=j
+    mu=n1*n2/2.0
+    sigma2 = n1*n2*(n1+n2+1)/12.0 - (n1*n2*T)/(12.0*(n1+n2)*(n1+n2-1)) if (n1+n2)>1 else 0.0
+    sigma = (sigma2**0.5) if sigma2>0 else float("nan")
+    if not (sigma==sigma) or sigma<=0: return (U, float("nan"))
+    z=(U-mu+0.5)/sigma
+    p=2.0*(1.0 - 0.5*(1.0+math.erf(abs(z)/math.sqrt(2.0))))
+    return (U, max(0.0, min(1.0, p)))
 
-    frag_df = frag_df.copy()
-    frag_df["rt_min"] = win_df.loc[frag_df["window_idx"].values, "rt_min"].values
+def cliffs_delta(x, y):
+    # small helper for effect size (optional)
+    x=np.asarray(x); y=np.asarray(y)
+    n1=len(x); n2=len(y)
+    if n1==0 or n2==0: return float("nan")
+    gt = sum((xi>yj) for xi in x for yj in y)
+    lt = sum((xi<yj) for xi in x for yj in y)
+    return (gt - lt) / (n1*n2)
 
-    # Fast access
-    pep_list = df_peptides["peptide"].tolist()
-    pep_mass = df_peptides["mass"].values
-    pep_rt_map = {pep_list[i]: pep_rt_min[i] for i in range(len(pep_list))}
-    win_seq_list = win_df["window"].tolist()
-    win_seq_list_xle = [collapse_xle(s) if xle_collapse else s for s in win_seq_list]
+def bh_fdr(pvals: Dict[str,float]) -> Dict[str,float]:
+    valid=[(k,v) for k,v in pvals.items() if isinstance(v,float) and v==v]
+    m=len(valid)
+    if m==0: return {k: float("nan") for k in pvals}
+    valid.sort(key=lambda kv: kv[1])
+    qs=[0.0]*m
+    for i,(_,p) in enumerate(valid): qs[i] = p*m/(i+1)
+    for i in range(m-2,-1,-1): qs[i]=min(qs[i], qs[i+1])
+    out={}
+    for i,(k,_) in enumerate(valid): out[k]=min(qs[i],1.0)
+    for k in pvals.keys():
+        if k not in out: out[k]=float("nan")
+    return out
 
-    # Fragment search helpers
-    frag_mz_vals_all = frag_df["frag_mz"].values  # sorted
-    def any_frag_mz_match_global(q_mz: float, ppm: float) -> bool:
-        # binary search in global sorted list
-        import bisect
-        delta = q_mz * ppm * 1e-6
-        lo, hi = q_mz - delta, q_mz + delta
-        L = bisect.bisect_left(frag_mz_vals_all, lo)
-        R = bisect.bisect_right(frag_mz_vals_all, hi)
-        return R > L
+# ---------- Plot helpers ----------
+def pretty_feature_name(set_name: str, metric_key: str) -> str:
+    label_set = SET_FRIENDLY.get(set_name, set_name.replace("_"," "))
+    m = {
+        "precursor_mz_match_fraction": f"{label_set}: precursor m/z (fraction)",
+        "precursor_mz_match_fraction_rt": f"{label_set}: precursor m/z (fraction, RT‑gated)",
+        "fragment_mz_match_fraction": f"{label_set}: fragment m/z (fraction)",
+        "fragment_mz_match_fraction_rt": f"{label_set}: fragment m/z (fraction, RT‑gated)",
+        "confusability_simple_mean": f"{label_set}: simple confusability",
+        "contam_score": f"{label_set}: contamination score",
+        "contam_score_rt": f"{label_set}: contamination score (RT‑gated)",
+    }
+    return m.get(metric_key, f"{label_set}: {metric_key.replace('_',' ')}")
 
-    def peptide_fragments(pep: str):
-        Lp = len(pep)
-        kmax_eff = max(frag_kmin, min(frag_kmax, Lp-1))
-        ks = list(range(frag_kmin, kmax_eff+1)) if kmax_eff >= frag_kmin else []
-        fr_mzs = []   # (mz, ion, k, z)
-        fr_keys = []  # (ion, k, seq_c)
-        for k in ks:
-            bseq = pep[:k]; yseq = pep[-k:]
-            bseq_c = collapse_xle(bseq) if xle_collapse else bseq
-            yseq_c = collapse_xle(yseq) if xle_collapse else yseq
-            fr_keys.append(("b", k, bseq_c)); fr_keys.append(("y", k, yseq_c))
-            for z in frag_charges:
-                fr_mzs.append((frag_b_mz(bseq, z), "b", k, z))
-                fr_mzs.append((frag_y_mz(yseq, z), "y", k, z))
-        return fr_mzs, fr_keys
+def safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._+-]+", "_", s)
 
-    # Count fragment m/z matches restricted to a subset of windows (for chaining)
-    # Build a quick mapping window_idx -> sorted fragment m/z array (numpy)
-    fr_by_win = None
-    if not frag_df.empty:
-        fr_by_win = (frag_df.groupby("window_idx")["frag_mz"]
-                     .apply(lambda s: np.sort(s.values.astype(float))).to_dict())
+def save_boxplot_simple(x, y, title, ylabel, outpath):
+    fig, ax = plt.subplots(constrained_layout=True)
+    ax.boxplot([x,y], showmeans=True, meanline=True)
+    jitter=0.08
+    ax.scatter([1+(random.random()-0.5)*2*jitter for _ in x], x, alpha=0.35, s=10)
+    ax.scatter([2+(random.random()-0.5)*2*jitter for _ in y], y, alpha=0.35, s=10)
+    ax.set_xticks([1,2]); ax.set_xticklabels(["non-hit","hit"])
+    ax.set_title(title); ax.set_ylabel(ylabel); ax.set_ylim(bottom=0 if "score" in ylabel.lower() else None)
+    _grid(ax); fig.savefig(outpath, bbox_inches="tight", pad_inches=0.08); plt.close(fig)
 
-    def count_fragment_mz_over_window_subset(window_idxs: set, fr_mzs: List[Tuple[float,str,int,int]], ppm: float) -> int:
-        if not window_idxs or not fr_mzs or fr_by_win is None:
-            return 0
-        import bisect
-        matched = set()
-        # Concatenate per-window arrays only logically; search each separately
-        for (mz, ion, k, z) in fr_mzs:
-            delta = mz * ppm * 1e-6
-            lo, hi = mz - delta, mz + delta
-            hit = False
-            for w in window_idxs:
-                arr = fr_by_win.get(int(w))
-                if arr is None or arr.size == 0: 
-                    continue
-                L = bisect.bisect_left(arr, lo)
-                R = bisect.bisect_right(arr, hi)
-                if R > L:
-                    hit = True; break
-            if hit:
-                matched.add((ion,k,z))
-        return len(matched)
+def save_summary_plot(stats_df: pd.DataFrame, alpha: float, outpath: str,
+                      top_n: int=20, min_nnz_topn: int=4):
+    # Uncapped −log10(p/q); highlight q line if provided
+    def neglog10(p):
+        try:
+            if 0.0 < float(p) <= 1.0: return -math.log10(float(p))
+        except Exception: pass
+        return 0.0
+    df=stats_df.copy()
+    if "nnz_nonhit" in df and "nnz_hit" in df:
+        df = df[(df["nnz_nonhit"]>=min_nnz_topn) & (df["nnz_hit"]>=min_nnz_topn)]
+    df["score"] = df.apply(lambda r: neglog10(r["q_value"]) if (isinstance(r["q_value"],float) and r["q_value"]>0) else neglog10(r["p_value"]), axis=1)
+    df = df[df["score"]>0].copy()
+    if df.empty:
+        fig,ax=plt.subplots(figsize=(8,3.5)); ax.set_title("No signals"); ax.set_xticks([]); ax.set_yticks([]); _grid(ax)
+        fig.savefig(outpath); plt.close(fig); return
+    top = df.sort_values("score", ascending=False).head(int(top_n))
+    fig, ax = plt.subplots(figsize=(max(8,len(top)*0.34),5))
+    ax.bar(range(len(top)), top["score"].tolist())
+    labels = [r["feature"] for _, r in top.iterrows()]
+    ax.set_xticks(range(len(top)), labels, rotation=90)
+    ax.set_ylabel("−log10(p or q)"); ax.set_title("Feature significance summary")
+    if alpha and alpha>0:
+        cutoff = -math.log10(alpha); ax.axhline(cutoff, ls="--", lw=1.0); ax.text(0.0, cutoff*1.02, f"q={alpha:g}", va="bottom")
+    _grid(ax); plt.tight_layout(); fig.savefig(outpath); plt.close(fig)
 
-    # Per-protein precursor burden (for correlation)
-    per_protein_rows = []
+def save_heatmap(df: pd.DataFrame, title: str, outpath: str, vmin=-1.0, vmax=1.0, cmap="coolwarm"):
+    if df.empty:
+        fig,ax=plt.subplots(figsize=(6,3)); ax.set_title(title); ax.text(0.5,0.5,"(no data)",ha="center",va="center"); ax.axis("off")
+        fig.savefig(outpath); plt.close(fig); return
+    fig, ax = plt.subplots(figsize=(max(6, 0.6*len(df.columns)), max(4, 0.6*len(df.index))))
+    im = ax.imshow(df.values, vmin=vmin, vmax=vmax, cmap=cmap)
+    ax.set_xticks(range(len(df.columns))); ax.set_xticklabels(df.columns, rotation=90)
+    ax.set_yticks(range(len(df.index))); ax.set_yticklabels(df.index)
+    ax.set_title(title)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cbar.set_label("Pearson r")
+    plt.tight_layout(); fig.savefig(outpath); plt.close(fig)
 
-    # Compute metrics per peptide
-    scores_rows = []
-    for i, pep in enumerate(tqdm(pep_list, desc=f"[sets-chained] scoring peptides (set={set_name}, mode={mode})")):
-        rt_pep = pep_rt_map[pep]
-        pmass = pep_mass[i]
+def save_bar_enrichment(enrich_df: pd.DataFrame, outpath: str, col: str, title: str):
+    if enrich_df.empty or col not in enrich_df.columns: 
+        fig,ax=plt.subplots(); ax.set_title("No data"); fig.savefig(outpath); plt.close(fig); return
+    df = enrich_df.copy()
+    df = df.sort_values(col, ascending=False)
+    fig, ax = plt.subplots(figsize=(max(8, 0.35*len(df)), 5))
+    ax.bar(range(len(df)), df[col].values.tolist())
+    ax.set_xticks(range(len(df))); ax.set_xticklabels(df["set"].tolist(), rotation=90)
+    ax.set_ylabel(col.replace("_"," ")); ax.set_title(title)
+    _grid(ax); fig.tight_layout(); fig.savefig(outpath); plt.close(fig)
 
-        # Precursor-matched window idxs
-        matched_win_idxs = set(pairs.get(pep, set()))
-        N_precursor_mz = float(len(matched_win_idxs))
-
-        # For protein correlation
-        for w in matched_win_idxs:
-            per_protein_rows.append({
-                "set_name": set_name, "mode": mode,
-                "query_peptide": pep,
-                "protein_short": win_df.at[w, "protein_short"],
-                "accession": win_df.at[w, "accession"],
-                "n_windows": 1
-            })
-
-        # RT-gated subset
-        rt_ok_win_idxs = {w for w in matched_win_idxs if abs(win_df.at[w,"rt_min"] - rt_pep) <= rt_tol}
-        N_precursor_mz_rt = float(len(rt_ok_win_idxs))
-
-        # Peptide fragments (m/z list + seq keys)
-        fr_mzs, fr_keys = peptide_fragments(pep)
-        n_fragment_types = float(len(fr_mzs))  # denominator for Frac_fragment_* (types are (ion,k,z))
-
-        # (Ungated) fragment m/z vs ANY window
-        matched_any = 0
-        if fr_mzs:
-            seen = set()
-            for (mz, ion, k, z) in fr_mzs:
-                if any_frag_mz_match_global(mz, frag_ppm):
-                    seen.add((ion,k,z))
-            matched_any = len(seen)
-        N_fragment_mz_any = float(matched_any)
-        Frac_fragment_mz_any = N_fragment_mz_any / max(1.0, n_fragment_types)
-
-        # RT-gated fragment m/z vs ANY window (filter frag_df by RT proximity)
-        matched_rt = 0
-        if fr_mzs and not frag_df.empty:
-            # Build a boolean mask of fragment rows that are within RT tolerance to peptide RT
-            close = frag_df.index[np.abs(frag_df["rt_min"].values - rt_pep) <= rt_tol]
-            if close.size > 0:
-                arr = np.sort(frag_df.loc[close, "frag_mz"].values.astype(float))
-                import bisect
-                seen = set()
-                for (mz, ion, k, z) in fr_mzs:
-                    delta = mz * frag_ppm * 1e-6
-                    lo, hi = mz - delta, mz + delta
-                    L = bisect.bisect_left(arr, lo); R = bisect.bisect_right(arr, hi)
-                    if R > L: seen.add((ion,k,z))
-                matched_rt = len(seen)
-        N_fragment_mz_rt = float(matched_rt)
-        Frac_fragment_mz_rt = N_fragment_mz_rt / max(1.0, n_fragment_types)
-
-        # NEW: Chained fragment m/z (restricted to precursor-matched windows)
-        N_fragment_mz_given_precursor = float(count_fragment_mz_over_window_subset(matched_win_idxs, fr_mzs, frag_ppm))
-        Frac_fragment_mz_given_precursor = N_fragment_mz_given_precursor / max(1.0, n_fragment_types)
-
-        # NEW: Chained fragment m/z with RT (restricted to precursor+RT windows)
-        N_fragment_mz_given_precursor_rt = float(count_fragment_mz_over_window_subset(rt_ok_win_idxs, fr_mzs, frag_ppm))
-        Frac_fragment_mz_given_precursor_rt = N_fragment_mz_given_precursor_rt / max(1.0, n_fragment_types)
-
-        # Fragment sequence containment given precursor / precursor+RT (I/L collapse optional)
-        frag_seq_set = set(fr_keys)  # tuples ("b"/"y", k, seq_c)
-        # given precursor
-        matched_seq_given_prec = set()
-        if matched_win_idxs and frag_seq_set:
-            for ion, k, seq_c in frag_seq_set:
-                for w in matched_win_idxs:
-                    if seq_c in win_seq_list_xle[w]:
-                        matched_seq_given_prec.add((ion,k,seq_c)); break
-        N_fragment_sequence_given_precursor = float(len(matched_seq_given_prec))
-        Frac_fragment_sequence_given_precursor = N_fragment_sequence_given_precursor / max(1.0, float(len(frag_seq_set)))
-
-        # given precursor + RT
-        matched_seq_given_prec_rt = set()
-        if rt_ok_win_idxs and frag_seq_set:
-            for ion, k, seq_c in frag_seq_set:
-                for w in rt_ok_win_idxs:
-                    if seq_c in win_seq_list_xle[w]:
-                        matched_seq_given_prec_rt.add((ion,k,seq_c)); break
-        N_fragment_sequence_given_precursor_rt = float(len(matched_seq_given_prec_rt))
-        Frac_fragment_sequence_given_precursor_rt = N_fragment_sequence_given_precursor_rt / max(1.0, float(len(frag_seq_set)))
-
-        scores_rows.append({
-            "set_name": set_name, "mode": mode, "query_peptide": pep,
-            # precursor counts
-            "N_precursor_mz": N_precursor_mz,
-            "N_precursor_mz_rt": N_precursor_mz_rt,
-            # fragment m/z (global)
-            "N_fragment_mz_any": N_fragment_mz_any,
-            "Frac_fragment_mz_any": Frac_fragment_mz_any,
-            "N_fragment_mz_rt": N_fragment_mz_rt,
-            "Frac_fragment_mz_rt": Frac_fragment_mz_rt,
-            # fragment m/z (chained to precursor windows)
-            "N_fragment_mz_given_precursor": N_fragment_mz_given_precursor,
-            "Frac_fragment_mz_given_precursor": Frac_fragment_mz_given_precursor,
-            "N_fragment_mz_given_precursor_rt": N_fragment_mz_given_precursor_rt,
-            "Frac_fragment_mz_given_precursor_rt": Frac_fragment_mz_given_precursor_rt,
-            # fragment sequence containment (chained)
-            "N_fragment_sequence_given_precursor": N_fragment_sequence_given_precursor,
-            "Frac_fragment_sequence_given_precursor": Frac_fragment_sequence_given_precursor,
-            "N_fragment_sequence_given_precursor_rt": N_fragment_sequence_given_precursor_rt,
-            "Frac_fragment_sequence_given_precursor_rt": Frac_fragment_sequence_given_precursor_rt,
-            # bookkeeping
-            "n_fragment_types_considered": n_fragment_types,
-            "rt_min_peptide": float(rt_pep),
-        })
-
-    per_protein_df = pd.DataFrame(per_protein_rows)
-    if not per_protein_df.empty:
-        per_protein_df = (per_protein_df.groupby(["set_name","mode","query_peptide","protein_short","accession"])
-                          ["n_windows"].sum().reset_index())
-
-    return scores_rows, per_protein_df
-
-# ---- Confusability and effects ----
-def add_confusability(scores_df: pd.DataFrame) -> pd.DataFrame:
-    out = scores_df.copy()
-
-    # helper to get 95th-percentile cap per group
-    def cap(series):
-        if series.empty: return 1.0
-        p95 = float(series.quantile(0.95))
-        return p95 if p95 > 0 else 1.0
-
-    rows = []
-    for (sname, mode), sub in out.groupby(["set_name","mode"], dropna=False):
-        c1 = cap(sub["N_precursor_mz"])
-        c2 = cap(sub["N_precursor_mz_rt"])
-        norm1 = (sub["N_precursor_mz"] / c1).clip(0,1)
-        norm2 = (sub["N_precursor_mz_rt"] / c2).clip(0,1)
-        # Simple mean of 4 evidences (two normalized counts + two fractions)
-        conf_simple = (norm1 + norm2 + sub["Frac_fragment_mz_given_precursor"].clip(0,1)
-                       + sub["Frac_fragment_mz_given_precursor_rt"].clip(0,1)) / 4.0
-        tmp = sub.copy()
-        tmp["Norm_N_precursor_mz"] = norm1.astype(float)
-        tmp["Norm_N_precursor_mz_rt"] = norm2.astype(float)
-        tmp["Confusability_simple"] = conf_simple.astype(float)
-        rows.append(tmp)
-    return pd.concat(rows, ignore_index=True) if rows else out
-
-def compute_effects(scores_df: pd.DataFrame, peptides_df: pd.DataFrame,
-                    effect_threshold: float, prevalence_threshold: float, min_group_n: int) -> pd.DataFrame:
-    if "is_hit" not in peptides_df.columns:
-        return pd.DataFrame()
-    tmp = scores_df.merge(
-        peptides_df[["peptide","is_hit"]].rename(columns={"peptide":"query_peptide"}),
-        on="query_peptide", how="left"
-    )
-    metrics = [
-        # precursor
-        "N_precursor_mz","N_precursor_mz_rt",
-        # fragment m/z (global)
-        "N_fragment_mz_any","Frac_fragment_mz_any","N_fragment_mz_rt","Frac_fragment_mz_rt",
-        # fragment m/z (chained)
-        "N_fragment_mz_given_precursor","Frac_fragment_mz_given_precursor",
-        "N_fragment_mz_given_precursor_rt","Frac_fragment_mz_given_precursor_rt",
-        # fragment sequence (chained)
-        "N_fragment_sequence_given_precursor","Frac_fragment_sequence_given_precursor",
-        "N_fragment_sequence_given_precursor_rt","Frac_fragment_sequence_given_precursor_rt",
-        # confusability
-        "Confusability_simple"
-    ]
-    out_rows = []
-    for (sname, mode), sub in tmp.groupby(["set_name","mode"], dropna=False):
-        for m in metrics:
-            x_hit = sub.loc[sub["is_hit"]==1, m]
-            x_non = sub.loc[sub["is_hit"]==0, m]
-            n_hit, n_non = len(x_hit), len(x_non)
-            mean_hit = float(pd.to_numeric(x_hit, errors="coerce").mean()) if n_hit else np.nan
-            mean_non = float(pd.to_numeric(x_non, errors="coerce").mean()) if n_non else np.nan
-            prop_nz_hit = float((pd.to_numeric(x_hit, errors="coerce") > 0).mean()) if n_hit else np.nan
-            prop_nz_non = float((pd.to_numeric(x_non, errors="coerce") > 0).mean()) if n_non else np.nan
-            auc, delta = mannwhitney_auc_cliffs(x_hit, x_non) if (n_hit and n_non) else (np.nan, np.nan)
-            prevalence = max(prop_nz_hit if not np.isnan(prop_nz_hit) else 0.0,
-                             prop_nz_non if not np.isnan(prop_nz_non) else 0.0)
-            enriched = (n_hit>=min_group_n and n_non>=min_group_n and
-                        (not np.isnan(delta)) and delta>=effect_threshold and prevalence>=prevalence_threshold)
-            out_rows.append(dict(set_name=sname, mode=mode, metric=m,
-                                 n_hit=n_hit, n_non=n_non,
-                                 mean_hit=mean_hit, mean_non=mean_non,
-                                 delta_mean=(mean_hit-mean_non) if (not np.isnan(mean_hit) and not np.isnan(mean_non)) else np.nan,
-                                 prop_nonzero_hit=prop_nz_hit, prop_nonzero_non=prop_nz_non,
-                                 auc=auc, cliffs_delta=delta, size_class=classify_delta(delta),
-                                 prevalence=prevalence, enriched=bool(enriched)))
-    return pd.DataFrame(out_rows)
-
-# ---- Plotting ----
-def plot_delta_bars(effects_df: pd.DataFrame, metric: str, mode: str, thr: float, outdir: str):
-    sub = effects_df[(effects_df["metric"]==metric) & (effects_df["mode"]==mode)].copy()
-    if sub.empty: return
-    sub.sort_values("cliffs_delta", ascending=True, inplace=True)
-    fig, ax = plt.subplots(figsize=(max(8,0.6*len(sub)+3), 5.2))
-    x = np.arange(len(sub))
-    ax.bar(x, sub["cliffs_delta"].values)
-    ax.axhline(thr, linestyle="--")
-    ax.set_xticks(x); ax.set_xticklabels(sub["set_name"].values, rotation=45, ha="right")
-    ax.set_ylabel("Cliff's δ (hits > non-hits)")
-    ax.set_title(f"Effect sizes — {metric} — mode={mode}")
-    for i, r in enumerate(sub.itertuples(index=False)):
-        if bool(r.enriched):
-            ax.text(i, r.cliffs_delta + 0.02, "•", ha="center", va="bottom")
-    add_grid(ax); fig.tight_layout()
-    fig.savefig(os.path.join(outdir, f"bar_delta__{safe_slug(metric)}__mode_{safe_slug(mode)}.png"))
-    plt.close(fig)
-
-def plot_flagged_boxplots(scores_df: pd.DataFrame, peptides_df: pd.DataFrame,
-                          effects_df: pd.DataFrame, max_flag_plots: int, outdir: str):
-    if "is_hit" not in peptides_df.columns: return
-    tmp = scores_df.merge(
-        peptides_df[["peptide","is_hit"]].rename(columns={"peptide":"query_peptide"}),
-        on="query_peptide", how="left"
-    )
-    flagged = effects_df.loc[effects_df["enriched"]==True].copy()
-    if flagged.empty: return
-    flagged["abs_delta"] = flagged["cliffs_delta"].abs()
-    flagged.sort_values(["metric","mode","abs_delta"], ascending=[True, True, False], inplace=True)
-    ctr = 0
-    for _, r in flagged.iterrows():
-        if ctr >= max_flag_plots: break
-        sname, mode, metric = r["set_name"], r["mode"], r["metric"]
-        sub = tmp[(tmp["set_name"]==sname) & (tmp["mode"]==mode)]
-        if sub.empty or metric not in sub.columns: continue
-        non = pd.to_numeric(sub.loc[sub["is_hit"]==0, metric], errors="coerce").fillna(0.0).values
-        hit = pd.to_numeric(sub.loc[sub["is_hit"]==1, metric], errors="coerce").fillna(0.0).values
-        fig, ax = plt.subplots()
-        ax.boxplot([non, hit], labels=[f"non-hit (n={len(non)})", f"hit (n={len(hit)})"], showmeans=True, meanline=True)
-        ax.set_ylabel(f"{metric} per peptide")
-        ax.set_title(f"{metric} — {sname} — mode={mode} (δ={r['cliffs_delta']:+.3f}, Δmean={r['delta_mean']:+.2f})")
-        add_grid(ax); fig.tight_layout()
-        fig.savefig(os.path.join(outdir, f"box_{safe_slug(metric)}__{safe_slug(sname)}__mode_{safe_slug(mode)}__FLAG.png"))
-        plt.close(fig)
-        ctr += 1
-
-def plot_score_corr(scores_df: pd.DataFrame, set_name: str, mode: str, outdir: str):
-    metrics = [
-        "Norm_N_precursor_mz","Norm_N_precursor_mz_rt",
-        "Frac_fragment_mz_any","Frac_fragment_mz_rt",
-        "Frac_fragment_mz_given_precursor","Frac_fragment_mz_given_precursor_rt",
-        "Confusability_simple"
-    ]
-    sub = scores_df[(scores_df["set_name"]==set_name) & (scores_df["mode"]==mode)][metrics]
-    if sub.empty: return
-    corr = sub.corr(numeric_only=True)
-    fig, ax = plt.subplots(figsize=(1.4*len(metrics), 1.0*len(metrics)+1.2))
-    im = ax.imshow(corr.values, vmin=-1, vmax=1, cmap="coolwarm")
-    ax.set_xticks(range(len(metrics))); ax.set_xticklabels(metrics, rotation=45, ha="right")
-    ax.set_yticks(range(len(metrics))); ax.set_yticklabels(metrics)
-    ax.set_title(f"Score correlations — {set_name} — mode={mode}")
-    cb = fig.colorbar(im, ax=ax); cb.set_label("Pearson r")
-    fig.tight_layout()
-    fig.savefig(os.path.join(outdir, f"heatmap_score_corr__{safe_slug(set_name)}__mode_{safe_slug(mode)}.png"))
-    plt.close(fig)
-
-def plot_protein_corr(per_protein_df: pd.DataFrame, set_name: str, mode: str, topN: int, outdir: str):
-    sub = per_protein_df[(per_protein_df["set_name"]==set_name) & (per_protein_df["mode"]==mode)]
-    if sub.empty: return
-    totals = (sub.groupby(["protein_short","accession"])["n_windows"].sum()
-                .sort_values(ascending=False).head(topN))
-    keep = totals.index.tolist()
-    sub = sub.set_index(["protein_short","accession"]).loc[keep].reset_index()
-    mat = sub.pivot_table(index="query_peptide", columns=["protein_short","accession"], values="n_windows", fill_value=0)
-    if mat.shape[1] < 2: return
-    corr = mat.corr()
-    fig, ax = plt.subplots(figsize=(max(8, 0.45*corr.shape[1]+3), max(6, 0.45*corr.shape[0]+2)))
-    im = ax.imshow(corr.values, vmin=-1, vmax=1, cmap="coolwarm")
-    ax.set_xticks(range(corr.shape[1])); ax.set_yticks(range(corr.shape[0]))
-    col_labels = [f"{a[0]}({a[1]})" for a in corr.columns]
-    ax.set_xticklabels(col_labels, rotation=90)
-    ax.set_yticklabels(col_labels)
-    ax.set_title(f"Protein vs protein correlation (precursor matches) — {set_name} — mode={mode}")
-    cb = fig.colorbar(im, ax=ax); cb.set_label("Pearson r")
-    fig.tight_layout()
-    fig.savefig(os.path.join(outdir, f"heatmap_protein_corr__{safe_slug(set_name)}__mode_{safe_slug(mode)}.png"))
-    plt.close(fig)
-
-# ---- Orchestrator ----
-def main():
-    ap = argparse.ArgumentParser(description="Protein-SET m/z screen with chained fragment evidence and simple confusability.")
-    ap.add_argument("--in", dest="input_csv", required=True, help="CSV with peptide[, is_hit]")
-    ap.add_argument("--outdir", default="mzscreen_sets_chained_out", help="Output directory")
-
-    ap.add_argument("--kmin_subseq", type=int, default=5, help="Minimum protein subsequence length (default 5)")
-    ap.add_argument("--kmax_subseq", type=int, default=15, help="Maximum protein subsequence length (default 15)")
-    ap.add_argument("--charges", type=str, default="1,2,3", help="Precursor charges to test (default '1,2,3')")
-    ap.add_argument("--prec_ppm", type=float, default=30.0, help="Precursor m/z tolerance in ppm (default 30)")
-
-    ap.add_argument("--frag_kmin", type=int, default=2, help="Minimum b/y fragment length (default 2)")
-    ap.add_argument("--frag_kmax", type=int, default=7, help="Maximum b/y fragment length (default 7)")
-    ap.add_argument("--frag_charges", type=str, default="1,2,3", help="Fragment charges to test (default '1,2,3')")
-    ap.add_argument("--frag_ppm", type=float, default=30.0, help="Fragment m/z tolerance in ppm (default 30)")
-
-    ap.add_argument("--rt_total_min", type=float, default=20.0, help="Simulated LC gradient length in minutes (default 20)")
-    ap.add_argument("--rt_tol", type=float, default=1.0, help="RT co-elution tolerance in minutes (default 1.0)")
-    ap.add_argument("--xle_collapse", action="store_true", help="Treat I/L as indistinguishable for sequence containment (default off)")
-
-    ap.add_argument("--prot_fasta", type=str, default=None, help="User-provided FASTA to source set/base proteins (optional)")
-    ap.add_argument("--download_common", action="store_true", help="Allow UniProt downloads for missing accessions")
-    ap.add_argument("--accessions", type=str, default=None, help="Text file of accessions to define/extend the base panel (optional)")
-
-    ap.add_argument("--sets", type=str, default="albumin,antibody,keratin,serum,cytoskeleton,chaperone", help="Comma-separated set names")
-    ap.add_argument("--set_mode", type=str, choices=["alone","union","both"], default="both", help="Test sets alone, union-with-base, or both")
-    ap.add_argument("--sets_config", type=str, default=None, help="JSON: {\"set_name\": {\"accessions\": [\"P12345\", ...]}, ...}")
-
-    ap.add_argument("--effect_threshold", type=float, default=0.147, help="Cliff's δ threshold to flag enrichment (default 0.147)")
-    ap.add_argument("--prevalence_threshold", type=float, default=0.10, help="Min fraction with ≥1 match in either group (default 0.10)")
-    ap.add_argument("--min_group_n", type=int, default=10, help="Min peptides per group for effects (default 10)")
-
-    ap.add_argument("--prot_corr_top", type=int, default=30, help="Top-N proteins to show in protein-correlation heatmap (default 30)")
-    ap.add_argument("--max_flag_plots", type=int, default=36, help="Max # of flagged boxplots to emit (default 36)")
-
-    args = ap.parse_args()
-
+# ---------- Analysis ----------
+def run(args):
+    # Setup
+    assert os.path.isfile(args.input_csv), "--in not found"
     os.makedirs(args.outdir, exist_ok=True)
     plots_dir = os.path.join(args.outdir, "plots"); os.makedirs(plots_dir, exist_ok=True)
+    subdirs = {
+        "precursor": os.path.join(plots_dir, "precursor"),
+        "fragment": os.path.join(plots_dir, "fragment"),
+        "confusability": os.path.join(plots_dir, "confusability"),
+        "sets": os.path.join(plots_dir, "sets"),
+        "correlations": os.path.join(plots_dir, "correlations"),
+        "overlaps": os.path.join(plots_dir, "overlaps"),
+        "score": os.path.join(plots_dir, "score")
+    }
+    for d in subdirs.values(): os.makedirs(d, exist_ok=True)
 
-    # Read peptides
+    # Read input
     df = pd.read_csv(args.input_csv)
-    if "peptide" not in df.columns:
-        raise ValueError("Input CSV must include a 'peptide' column.")
-    df["peptide"] = df["peptide"].astype(str).str.strip().str.upper()
+    if args.min_score is not None and "is_hit" not in df.columns:
+        score_col = next((c for c in df.columns if c.lower()=="score"), None)
+        if score_col is None: raise ValueError("--min_score provided but no 'score' column")
+        df["is_hit"] = (pd.to_numeric(df[score_col], errors="coerce") >= float(args.min_score)).astype(int)
+    assert "peptide" in df.columns and "is_hit" in df.columns, "input must have 'peptide,is_hit' (or --min_score)"
+    df["peptide"] = df["peptide"].map(clean_pep)
     df = df[df["peptide"].str.len()>0].copy()
-    df["mass"] = df["peptide"].apply(calc_mass)
-    has_hit = "is_hit" in df.columns
-    if has_hit:
-        df["is_hit"] = df["is_hit"].astype(int)
+    df["is_hit"] = df["is_hit"].astype(int)
+    assert set(df["is_hit"].unique()) <= {0,1}, "is_hit must be 0/1"
+    g0n = (df["is_hit"]==0).sum(); g1n = (df["is_hit"]==1).sum()
 
-    # Load base panel
-    base_seqs = load_common_proteins(args.prot_fasta, args.download_common, args.accessions)
-    all_fasta_seqs = {}
-    if args.prot_fasta and os.path.isfile(args.prot_fasta):
-        with open_maybe_gzip(args.prot_fasta) as fh:
-            all_fasta_seqs = parse_fasta(fh.read())
+    # Chemistry config
+    charges = sorted({int(z.strip()) for z in args.charges.split(",") if z.strip()})
+    assert charges and all(z>0 for z in charges)
+    cys_fixed_mod = 57.021464 if args.cys_mod=="carbamidomethyl" else 0.0
 
-    # Build set definitions (allow overrides)
-    set_defs = dict(DEFAULT_SETS)
-    if args.sets_config:
-        user_cfg = json.load(open(args.sets_config, "r"))
-        for sname, spec in user_cfg.items():
-            if isinstance(spec, dict):
-                accs = spec.get("accessions", [])
-            elif isinstance(spec, list):
-                accs = spec
+    # Core per‑peptide mass/RT
+    feat_rows=[]
+    for pep in tqdm(df["peptide"], desc="[1/9] Core peptide chemistry & RT"):
+        m = neutral_mass(pep, cys_fixed_mod)
+        feat_rows.append({
+            "peptide": pep,
+            "length": len(pep),
+            "mz_z1": mz_from_mass(m,1),
+            "mz_z2": mz_from_mass(m,2),
+            "mz_z3": mz_from_mass(m,3),
+            "rt_pred_min": predict_rt_min(pep, args.gradient_min),
+        })
+    feat = pd.DataFrame(feat_rows)
+
+    # Resolve set contents (load)
+    sets = [s.strip() for s in args.sets.split(",") if s.strip()]
+    seqs_by_set_raw: Dict[str, Dict[str,str]] = {}
+    for s in tqdm(sets, desc="[2/9] Loading SET sequences"):
+        seqs_by_set_raw[s] = load_set_sequences(s, args)
+
+    # Optional: split keratins into one source per accession
+    if args.split_keratin and "keratins" in seqs_by_set_raw:
+        ker = seqs_by_set_raw.pop("keratins")
+        new_names=[]
+        for acc, seq in ker.items():
+            nm = f"keratin_{acc}"
+            seqs_by_set_raw[nm] = {acc: seq}
+            new_names.append(nm)
+            SET_FRIENDLY[nm] = f"Keratins:{acc}"
+            SET_HINTS[nm] = SET_HINTS.get("keratins","Keratins")
+        sets = [s for s in sets if s!="keratins"] + new_names
+        print(f"[sets] split_keratin: created {len(new_names)} sources: {', '.join(new_names[:6])}{'...' if len(new_names)>6 else ''}")
+
+    # Overlap analysis + disjoint sets
+    resolved, overlap_mat, overlap_report = resolve_disjoint_sets(seqs_by_set_raw, sets)
+    if not overlap_mat.empty:
+        overlap_mat.to_csv(os.path.join(args.outdir, "set_overlap_matrix.csv"))
+        save_heatmap(overlap_mat.astype(float), "Pre‑dedup accession overlap", os.path.join(subdirs["overlaps"], "overlap_accessions.png"), vmin=0, vmax=max(1.0, overlap_mat.values.max()))
+    with open(os.path.join(args.outdir, "set_overlap_report.txt"), "w") as fh:
+        fh.write("\n".join(overlap_report))
+    with open(os.path.join(args.outdir, "sets_resolved.json"), "w") as fh:
+        json.dump({k: sorted(list(v.keys())) for k,v in resolved.items()}, fh, indent=2)
+
+    # Build windows per (disjoint) set + Script‑1‑style fragment indices
+    windows_by_set: Dict[str, List[Window]] = {}
+    frag_any_by_set: Dict[str, List[float]] = {}
+    for s in tqdm(sets, desc="[3/9] Building windows per set"):
+        seqs = list(resolved.get(s, {}).values())
+        if not seqs:
+            windows_by_set[s] = []
+            frag_any_by_set[s] = []
+            print(f"[sets][WARN] {s}: empty after resolving; skipping downstream metrics.")
+            continue
+        windows_by_set[s] = build_windows_index_for_sequences(
+            sequences=seqs,
+            len_min=min(args.full_mz_len_min, args.fragment_kmin),
+            len_max=max(args.full_mz_len_max, args.fragment_kmax),
+            charges=charges,
+            gradient_min=args.gradient_min,
+            cys_fixed_mod=cys_fixed_mod,
+        )
+        frag_any_by_set[s] = index_fragments_for_windows(
+            windows_by_set[s],
+            fragment_kmin=args.fragment_kmin, fragment_kmax=args.fragment_kmax,
+            charges=charges, cys_fixed_mod=cys_fixed_mod,
+        )
+        print(f"[sets] {s}: indexed {len(windows_by_set[s])} windows, {len(frag_any_by_set[s])} b/y fragments")
+
+    # Per‑peptide metrics vs each set (Script‑2 + Script‑1‑style + score)
+    per_set_rows: Dict[str, List[Dict[str,object]]] = {s: [] for s in sets}
+    for idx, pep in tqdm(list(enumerate(feat["peptide"])), total=len(feat), desc="[4/9] Per‑peptide metrics vs sets"):
+        pep_rt = feat.iloc[idx]["rt_pred_min"]
+        pmass = neutral_mass(pep, cys_fixed_mod)
+        pep_mz_by_z = {z: mz_from_mass(pmass, z) for z in charges}
+        frag_cache = peptide_fragment_mz_cache(pep, charges, cys_fixed_mod, args.fragment_kmin, args.fragment_kmax)
+
+        for s in sets:
+            wins = windows_by_set.get(s, [])
+            if not wins:
+                per_set_rows[s].append({
+                    "peptide": pep,
+                    # Script‑1-style (zeros)
+                    "N_precursor_mz": 0.0, "N_precursor_mz_rt": 0.0,
+                    "N_fragment_mz_any": 0.0, "Frac_fragment_mz_any": 0.0,
+                    "N_fragment_mz_rt": 0.0,  "Frac_fragment_mz_rt": 0.0,
+                    "N_fragment_mz_given_precursor": 0.0, "Frac_fragment_mz_given_precursor": 0.0,
+                    "N_fragment_mz_given_precursor_rt": 0.0, "Frac_fragment_mz_given_precursor_rt": 0.0,
+                    "N_fragment_sequence_given_precursor": 0.0, "Frac_fragment_sequence_given_precursor": 0.0,
+                    "N_fragment_sequence_given_precursor_rt": 0.0, "Frac_fragment_sequence_given_precursor_rt": 0.0,
+                    "contam_score": 0.0, "contam_score_rt": 0.0,
+                    # Script‑2 originals (NaN so they don't skew means)
+                    "precursor_mz_match_fraction": float("nan"),
+                    "precursor_mz_match_fraction_rt": float("nan"),
+                    "fragment_mz_match_fraction": float("nan"),
+                    "fragment_mz_match_fraction_rt": float("nan"),
+                    "precursor_confusability": float("nan"),
+                    "precursor_confusability_rt": float("nan"),
+                    "confusability_simple_mean": float("nan"),
+                    "precursor_best_ppm": float("nan"),
+                    "precursor_best_ppm_rt": float("nan"),
+                    "best_ppm": float("inf"), "best_ppm_rt": float("inf"),
+                })
             else:
-                raise ValueError(f"Invalid sets_config entry for '{sname}'.")
-            set_defs[sname] = list(dict.fromkeys(accs))
+                # Script‑1‑style metrics (+ score)
+                d1 = compute_set_metrics_script1_like(
+                    pep=pep,
+                    windows_all=wins,
+                    frag_any_sorted=frag_any_by_set[s],
+                    full_len_min=args.full_mz_len_min, full_len_max=args.full_mz_len_max,
+                    rt_pred_min=pep_rt, rt_tol_min=args.rt_tolerance_min,
+                    charges=charges, pep_mz_by_z=pep_mz_by_z,
+                    ppm_tol=args.ppm_tol,
+                    cys_fixed_mod=cys_fixed_mod,
+                    fragment_kmin=args.fragment_kmin, fragment_kmax=args.fragment_kmax,
+                    xle_collapse_flag=args.xle_collapse,
+                    good_ppm=args.score_prec_ppm_good, max_ppm=args.score_prec_ppm_max, frag_types_req=args.score_frag_types_req
+                )
+                # Script‑2 original metrics
+                prec_pool_all = [w for w in wins if args.full_mz_len_min <= w.length <= args.full_mz_len_max]
+                prec_pool_rt  = filter_rt(prec_pool_all, pep_rt, args.rt_tolerance_min)
+                prec_hits_all, prec_cand_all = count_precursor_matches(prec_pool_all, pep_mz_by_z, args.ppm_tol)
+                prec_hits_rt,  prec_cand_rt  = count_precursor_matches(prec_pool_rt,  pep_mz_by_z, args.ppm_tol)
+                prec_frac_all = (prec_hits_all / max(1, prec_cand_all)) if prec_cand_all>0 else 0.0
+                prec_frac_rt  = (prec_hits_rt  / max(1, prec_cand_rt))  if prec_cand_rt>0  else 0.0
+                best_all = best_precursor_error(prec_pool_all, pep_mz_by_z)
+                best_rt  = best_precursor_error(prec_pool_rt,  pep_mz_by_z) if prec_pool_rt else {"ppm": float("inf")}
+                conf_prec_all = ppm_to_score(best_all["ppm"], args.ppm_tol) if best_all["ppm"]==best_all["ppm"] else 0.0
+                conf_prec_rt  = ppm_to_score(best_rt["ppm"],  args.ppm_tol) if best_rt["ppm"]==best_rt["ppm"]  else 0.0
 
-    sets_to_run = [s.strip() for s in args.sets.split(",") if s.strip()]
-    modes = ["alone","union"] if args.set_mode == "both" else [args.set_mode]
+                frag_pool_all = prec_pool_all
+                frag_pool_rt  = prec_pool_rt
+                if args.require_precursor_match_for_fragment:
+                    def gate(wpool):
+                        gated=[]
+                        for w in wpool:
+                            ok=False
+                            for z, pmz in pep_mz_by_z.items():
+                                wmz = w.mz_by_z.get(z)
+                                if wmz is None: continue
+                                if ppm_diff(pmz, wmz) <= args.ppm_tol:
+                                    ok=True; break
+                            if ok: gated.append(w)
+                        return gated
+                    frag_pool_all = gate(prec_pool_all)
+                    frag_pool_rt  = gate(prec_pool_rt)
 
-    # Resolve sequences per set (download if needed)
-    set_sequences = {}
-    for s in sets_to_run:
-        accs = set_defs.get(s, [])
-        seqs = {}
-        if all_fasta_seqs and accs:
-            seqs = merge_seqs(seqs, select_seqs_by_accessions(all_fasta_seqs, accs))
-        if accs:
-            seqs = merge_seqs(seqs, select_seqs_by_accessions(base_seqs, accs))
-        if args.download_common and accs:
-            have = set(extract_accession(h) for h in seqs.keys())
-            need = [a for a in accs if a not in have]
-            if need:
-                print(f"[sets-chained] downloading {len(need)} proteins for set '{s}' ...")
-                seqs = merge_seqs(seqs, download_uniprot_by_accessions(need))
-        set_sequences[s] = seqs
+                frag_cache = peptide_fragment_mz_cache(pep, charges, cys_fixed_mod, args.fragment_kmin, args.fragment_kmax)
+                frag_mz_hits_all, frag_cand_all = fragment_any_mz_match_counts(
+                    frag_pool_all, frag_cache, args.ppm_tol, cys_fixed_mod, args.fragment_kmin, args.fragment_kmax
+                )
+                frag_mz_hits_rt,  frag_cand_rt  = fragment_any_mz_match_counts(
+                    frag_pool_rt,  frag_cache, args.ppm_tol, cys_fixed_mod, args.fragment_kmin, args.fragment_kmax
+                )
+                frag_frac_all = (frag_mz_hits_all / max(1, frag_cand_all)) if frag_cand_all>0 else 0.0
+                frag_frac_rt  = (frag_mz_hits_rt  / max(1, frag_cand_rt )) if frag_cand_rt >0 else 0.0
+                conf_simple_mean = (conf_prec_all + conf_prec_rt + frag_frac_all + frag_frac_rt) / 4.0
 
-    charges = [int(x) for x in args.charges.split(",") if x.strip()]
-    frag_charges = [int(x) for x in args.frag_charges.split(",") if x.strip()]
+                d2 = {
+                    "precursor_mz_match_fraction": prec_frac_all,
+                    "precursor_mz_match_fraction_rt": prec_frac_rt,
+                    "fragment_mz_match_fraction": frag_frac_all,
+                    "fragment_mz_match_fraction_rt": frag_frac_rt,
+                    "precursor_confusability": conf_prec_all,
+                    "precursor_confusability_rt": conf_prec_rt,
+                    "confusability_simple_mean": conf_simple_mean,
+                    "precursor_best_ppm": best_all["ppm"],
+                    "precursor_best_ppm_rt": best_rt["ppm"],
+                }
+                d_all = dict(d1); d_all.update(d2); d_all["peptide"]=pep
+                per_set_rows[s].append(d_all)
 
-    # Run each set × mode
-    scores_all = []
-    perprot_all = []
-    for s in sets_to_run:
-        for mode in modes:
-            rows, perprot = compute_per_peptide_metrics_for_set(
-                set_name=s, mode=mode,
-                df_peptides=df[["peptide","mass"]],
-                base_seqs=base_seqs, set_seqs=set_sequences.get(s, {}),
-                kmin_subseq=args.kmin_subseq, kmax_subseq=args.kmax_subseq,
-                charges=charges, prec_ppm=args.prec_ppm,
-                frag_kmin=args.frag_kmin, frag_kmax=args.frag_kmax, frag_charges=frag_charges, frag_ppm=args.frag_ppm,
-                rt_total_min=args.rt_total_min, rt_tol=args.rt_tol,
-                xle_collapse=args.xle_collapse,
-                prot_corr_top=args.prot_corr_top
-            )
-            if rows:
-                scores_all.extend(rows)
-            if not perprot.empty:
-                perprot_all.append(perprot)
+    # Merge all set features into feat
+    for s in sets:
+        alias = f"set_{s}__"
+        df_s = pd.DataFrame(per_set_rows[s])
+        df_s = df_s.add_prefix(alias).rename(columns={f"{alias}peptide":"peptide"})
+        feat = feat.merge(df_s, on="peptide", how="left")
 
-    if not scores_all:
-        raise RuntimeError("No results computed. Check sets, FASTA/download options, or peptide list.")
+    # Albumin convenience aliases (optional)
+    if "albumin" in sets:
+        cols_map = {
+            "precursor_mz_match_fraction": "alb_precursor_mz_match_fraction",
+            "precursor_mz_match_fraction_rt": "alb_precursor_mz_match_fraction_rt",
+            "fragment_mz_match_fraction": "alb_fragment_mz_match_fraction",
+            "fragment_mz_match_fraction_rt": "alb_fragment_mz_match_fraction_rt",
+            "precursor_confusability": "alb_precursor_confusability",
+            "precursor_confusability_rt": "alb_precursor_confusability_rt",
+            "confusability_simple_mean": "alb_confusability_simple_mean",
+            "N_precursor_mz": "alb_N_precursor_mz",
+            "N_precursor_mz_rt": "alb_N_precursor_mz_rt",
+            "contam_score": "alb_contam_score",
+            "contam_score_rt": "alb_contam_score_rt",
+        }
+        for k,v in cols_map.items():
+            src = f"set_albumin__{k}"
+            if src in feat.columns:
+                feat[v] = feat[src]
 
-    scores_df = pd.DataFrame(scores_all)
-    scores_df = add_confusability(scores_df)
-    scores_path = os.path.join(args.outdir, "per_peptide_scores__ALL.csv")
-    scores_df.to_csv(scores_path, index=False)
-    print(f"[sets-chained] Wrote: {scores_path}")
+    # Join labels & write features
+    feat = feat.merge(df[["peptide","is_hit"]], on="peptide", how="left")
 
-    if perprot_all:
-        perprot_df = pd.concat(perprot_all, ignore_index=True)
-        perprot_path = os.path.join(args.outdir, "per_peptide_per_protein_counts__ALL.csv")
-        perprot_df.to_csv(perprot_path, index=False)
-        print(f"[sets-chained] Wrote: {perprot_path}")
-    else:
-        perprot_df = pd.DataFrame()
+    # Add Script‑1‑style confusability from counts + chained fragment fractions
+    def add_confusability_like_script1(feat_df: pd.DataFrame, sets_list: list) -> pd.DataFrame:
+        out = feat_df.copy()
+        for s in sets_list:
+            base = f"set_{s}__"
+            c1 = f"{base}N_precursor_mz"
+            c2 = f"{base}N_precursor_mz_rt"
+            f1 = f"{base}Frac_fragment_mz_given_precursor"
+            f2 = f"{base}Frac_fragment_mz_given_precursor_rt"
+            if not all(c in out.columns for c in [c1,c2,f1,f2]): continue
+            p95_c1 = out[c1].quantile(0.95); p95_c2 = out[c2].quantile(0.95)
+            p95_c1 = float(p95_c1) if p95_c1>0 else 1.0
+            p95_c2 = float(p95_c2) if p95_c2>0 else 1.0
+            out[f"{base}Norm_N_precursor_mz"]    = (out[c1] / p95_c1).clip(0,1)
+            out[f"{base}Norm_N_precursor_mz_rt"] = (out[c2] / p95_c2).clip(0,1)
+            out[f"{base}Confusability_simple__script1"] = (
+                out[f"{base}Norm_N_precursor_mz"].clip(0,1)
+                + out[f"{base}Norm_N_precursor_mz_rt"].clip(0,1)
+                + out[f1].clip(0,1)
+                + out[f2].clip(0,1)
+            ) / 4.0
+        return out
 
-    # Effects and plots
-    effects_df = compute_effects(scores_df, df, args.effect_threshold, args.prevalence_threshold, args.min_group_n) if has_hit else pd.DataFrame()
-    eff_path = os.path.join(args.outdir, "effects_summary__ALL.csv")
-    if not effects_df.empty:
-        effects_df.sort_values(["metric","mode","cliffs_delta"], ascending=[True, True, False], inplace=True)
-        effects_df.to_csv(eff_path, index=False)
-        print(f"[sets-chained] Wrote: {eff_path}")
+    feat = add_confusability_like_script1(feat, sets)
+    feat.to_csv(os.path.join(args.outdir, "features.csv"), index=False)
 
-        # δ bars per metric × mode
-        metrics_unique = effects_df["metric"].drop_duplicates().tolist()
-        for m in metrics_unique:
-            for mode in modes:
-                plot_delta_bars(effects_df, m, mode, args.effect_threshold, plots_dir)
+    # ---------- Stats & plotting ----------
+    g0=feat[feat["is_hit"]==0]; g1=feat[feat["is_hit"]==1]
+    rows=[]; pmap={}
+    now=datetime.datetime.now().isoformat(timespec="seconds")
 
-        # Flagged boxplots
-        plot_flagged_boxplots(scores_df, df, effects_df, args.max_flag_plots, plots_dir)
+    # Script‑2 metrics (original) — per‑set plots and tests
+    metric_keys = ["precursor_mz_match_fraction","precursor_mz_match_fraction_rt",
+                   "fragment_mz_match_fraction","fragment_mz_match_fraction_rt",
+                   "confusability_simple_mean"]
 
-    # Correlations
-    for s in sets_to_run:
-        for mode in modes:
-            plot_score_corr(scores_df, s, mode, plots_dir)
-            if not perprot_df.empty:
-                plot_protein_corr(perprot_df, s, mode, args.prot_corr_top, plots_dir)
+    for s in tqdm(sets, desc="[5/9] Stats & plots per set (Script‑2 metrics)"):
+        base = f"set_{s}__"
+        for mk in metric_keys:
+            col = f"{base}{mk}"
+            if col not in feat.columns: continue
+            x = g0[col].dropna().tolist(); y = g1[col].dropna().tolist()
+            if len(x)==0 and len(y)==0: continue
+            U,p = mannwhitney_u_p(x,y)
+            mean0=float(pd.Series(x).mean()) if x else float("nan")
+            mean1=float(pd.Series(y).mean()) if y else float("nan")
+            nnz0=sum(1 for v in x if isinstance(v,(int,float)) and v!=0)
+            nnz1=sum(1 for v in y if isinstance(v,(int,float)) and v!=0)
+            featurename = f"{s}:{mk}"
+            rows.append({"feature": featurename, "set": s, "metric": mk, "type":"numeric", "test_used":"mannwhitney_u",
+                        "n_nonhit": len(x), "n_hit": len(y),
+                        "mean_nonhit": mean0, "mean_hit": mean1,
+                        "p_value": p, "q_value": float("nan"),
+                        "nnz_nonhit": nnz0, "nnz_hit": nnz1, "computed_at": now})
+            pmap[featurename]=p
 
-    # SUMMARY
-    summary_path = os.path.join(args.outdir, "SUMMARY_STATS.md")
-    lines = []
-    lines += [
-        "# WIQD protein‑set screen — chained fragment evidence",
-        "",
-        f"*Generated:* {datetime.datetime.now().isoformat(timespec='seconds')}",
-        f"*Input:* `{os.path.basename(args.input_csv)}`",
-        f"*Sets:* {', '.join(sets_to_run)}",
-        f"*Modes:* {', '.join(modes)}",
-        "",
-        "## Metrics (per peptide)",
-        f"- **N_precursor_mz** — # protein subseq windows (k={args.kmin_subseq}..{args.kmax_subseq}) sharing precursor m/z (z={args.charges}; ±{args.prec_ppm} ppm).",
-        f"- **N_precursor_mz_rt** — same, but require |ΔRT| ≤ {args.rt_tol} min on a {args.rt_total_min}‑min gradient.",
-        f"- **N/Frac_fragment_mz_any** — # and fraction of peptide b/y fragment **m/z** (k={args.frag_kmin}..{args.frag_kmax}, z={args.frag_charges}) matching ANY window fragments (±{args.frag_ppm} ppm).",
-        f"- **N/Frac_fragment_mz_rt** — as above, but only windows with |ΔRT| ≤ {args.rt_tol} min.",
-        "- **N/Frac_fragment_mz_given_precursor** — fragment m/z matching **restricted to the windows that passed the precursor screen**.",
-        "- **N/Frac_fragment_mz_given_precursor_rt** — restricted to windows that passed **precursor + RT**.",
-        "- **N/Frac_fragment_sequence_given_precursor[_rt]** — b/y **string containment** among precursor‑(±RT) windows (I/L collapse optional).",
-        "",
-        "## Confusability (simple)",
-        "- **Confusability_simple** = mean( Norm_N_precursor_mz, Norm_N_precursor_mz_rt, Frac_fragment_mz_given_precursor, Frac_fragment_mz_given_precursor_rt ).",
-        "- `Norm_*` are per set×mode counts capped at their 95th percentile and scaled to [0,1].",
-        "",
-        "## Notes",
-        "- All outputs are **per‑peptide** (counts) or **fractions**; group comparisons use Cliff’s δ and prevalence.",
-        "- Fragment m/z does not require same length or same end; sequence containment checks use b_k (prefix) and y_k (suffix).",
-        "- RT model is a simple KD‑based surrogate; intended only for co‑elution filtering.",
-        "",
-        "See `plots/` for δ bars (per metric × mode), flagged boxplots, and correlation heatmaps.",
+        # Per‑set summary figure (2×2 for Script‑2 fraction metrics)
+        cols = [f"{base}precursor_mz_match_fraction", f"{base}precursor_mz_match_fraction_rt",
+                f"{base}fragment_mz_match_fraction", f"{base}fragment_mz_match_fraction_rt"]
+        labels = ["precursor","precursor_rt","fragment","fragment_rt"]
+        vals = []
+        for c in cols:
+            if c in feat.columns:
+                vals.append((g0[c].dropna().tolist(), g1[c].dropna().tolist()))
+            else:
+                vals.append(([],[]))
+        fig, axes = plt.subplots(2,2, figsize=(7.6,5.6), constrained_layout=True)
+        for i,(ax,(x,y),lab) in enumerate(zip(axes.ravel(), vals, labels)):
+            if len(x)+len(y)>0:
+                ax.boxplot([x,y], showmeans=True, meanline=True)
+                jitter=0.08
+                ax.scatter([1+(random.random()-0.5)*2*jitter for _ in x], x, alpha=0.25, s=9)
+                ax.scatter([2+(random.random()-0.5)*2*jitter for _ in y], y, alpha=0.25, s=9)
+                ax.set_xticks([1,2]); ax.set_xticklabels(["non-hit","hit"])
+            ax.set_title(lab); ax.set_ylabel("fraction"); _grid(ax)
+        fig.suptitle(SET_FRIENDLY.get(s, s.replace("_"," ")))
+        fig.savefig(os.path.join(subdirs["sets"], f"{safe_name(s)}.png")); plt.close(fig)
+
+    # Script‑1‑style metrics + NEW contamination score
+    script1_metrics = [
+        "N_precursor_mz","N_precursor_mz_rt",
+        "N_fragment_mz_any","Frac_fragment_mz_any",
+        "N_fragment_mz_rt","Frac_fragment_mz_rt",
+        "N_fragment_mz_given_precursor","Frac_fragment_mz_given_precursor",
+        "N_fragment_mz_given_precursor_rt","Frac_fragment_mz_given_precursor_rt",
+        "contam_score","contam_score_rt",
+        "Norm_N_precursor_mz","Norm_N_precursor_mz_rt",
+        "Confusability_simple__script1",
     ]
-    with open(summary_path, "w") as fh:
-        fh.write("\n".join(lines))
-    print(f"[sets-chained] Wrote: {summary_path}")
+    for s in tqdm(sets, desc="[6/9] Stats (S1 metrics + score) & plots"):
+        base = f"set_{s}__"
+        # Tests
+        for mk in script1_metrics:
+            col = f"{base}{mk}"
+            if col not in feat.columns: continue
+            x = g0[col].dropna().tolist(); y = g1[col].dropna().tolist()
+            if len(x)==0 and len(y)==0: continue
+            U,p = mannwhitney_u_p(x,y)
+            mean0=float(pd.Series(x).mean()) if x else float("nan")
+            mean1=float(pd.Series(y).mean()) if y else float("nan")
+            nnz0=sum(1 for v in x if isinstance(v,(int,float)) and v!=0)
+            nnz1=sum(1 for v in y if isinstance(v,(int,float)) and v!=0)
+            featurename = f"{s}:{mk}"
+            rows.append({"feature": featurename, "set": s, "metric": mk, "type":"numeric", "test_used":"mannwhitney_u",
+                        "n_nonhit": len(x), "n_hit": len(y),
+                        "mean_nonhit": mean0, "mean_hit": mean1,
+                        "p_value": p, "q_value": float("nan"),
+                        "nnz_nonhit": nnz0, "nnz_hit": nnz1, "computed_at": now})
+            pmap[featurename]=p
+
+        # Plots for new contamination score (±RT)
+        for mk in ["contam_score","contam_score_rt"]:
+            col = f"{base}{mk}"
+            if col in feat.columns:
+                x = g0[col].dropna().tolist(); y = g1[col].dropna().tolist()
+                title = pretty_feature_name(s, mk)
+                outp = os.path.join(subdirs["score"], f"{safe_name(s)}{'_rt' if mk.endswith('_rt') else ''}.png")
+                save_boxplot_simple(x,y,title,"score [0..1]",outp)
+
+    # Assemble stats, FDR, and global summaries
+    stats_df = pd.DataFrame(rows)
+    qmap = bh_fdr(pmap)
+    stats_df["q_value"] = stats_df["feature"].map(qmap)
+    stats_df.to_csv(os.path.join(args.outdir, "stats_summary.csv"), index=False)
+
+    save_summary_plot(
+        stats_df, args.alpha,
+        os.path.join(args.outdir, "summary_feature_significance.png"),
+        top_n=args.summary_top_n, min_nnz_topn=args.min_nnz_topn
+    )
+
+    # ---------- Cross‑set enrichment summary using the new score ----------
+    enrich_rows=[]
+    for s in sets:
+        for mk in ["contam_score","contam_score_rt"]:
+            col = f"set_{s}__{mk}"
+            if col not in feat.columns: continue
+            x = pd.to_numeric(g0[col], errors="coerce")
+            y = pd.to_numeric(g1[col], errors="coerce")
+            x = x[~x.isna()]; y = y[~y.isna()]
+            if len(x)==0 and len(y)==0: continue
+            U,p = mannwhitney_u_p(x.tolist(), y.tolist())
+            q = qmap.get(f"{s}:{mk}", float("nan"))
+            delta_mean = float(y.mean() - x.mean()) if (len(x)>0 and len(y)>0) else float("nan")
+            cd = cliffs_delta(y.tolist(), x.tolist())
+            prev_non = float((x >= 0.9).mean()) if len(x)>0 else float("nan")
+            prev_hit = float((y >= 0.9).mean()) if len(y)>0 else float("nan")
+            enrich_rows.append({
+                "set": s, "metric": mk,
+                "mean_nonhit": float(x.mean()) if len(x)>0 else float("nan"),
+                "mean_hit": float(y.mean()) if len(y)>0 else float("nan"),
+                "delta_mean_hit_minus_non": delta_mean,
+                "cliffs_delta": cd,
+                "p_value": p, "q_value": q,
+                "prevalence_score_ge_0_9_nonhit": prev_non,
+                "prevalence_score_ge_0_9_hit": prev_hit,
+                "n_nonhit": int(len(x)), "n_hit": int(len(y)),
+            })
+    enrich_df = pd.DataFrame(enrich_rows)
+    enrich_df.to_csv(os.path.join(args.outdir, "contam_enrichment_summary.csv"), index=False)
+
+    # Bar summaries: Δmean for score (±RT)
+    if not enrich_df.empty:
+        sub = enrich_df[enrich_df["metric"]=="contam_score"][["set","delta_mean_hit_minus_non"]].copy()
+        if not sub.empty:
+            save_bar_enrichment(sub.rename(columns={"delta_mean_hit_minus_non":"delta_mean"}),
+                                os.path.join(plots_dir,"summary_contam_score_delta.png"),
+                                col="delta_mean", title="Enrichment by source (score, hits−non‑hits)")
+        subrt = enrich_df[enrich_df["metric"]=="contam_score_rt"][["set","delta_mean_hit_minus_non"]].copy()
+        if not subrt.empty:
+            save_bar_enrichment(subrt.rename(columns={"delta_mean_hit_minus_non":"delta_mean"}),
+                                os.path.join(plots_dir,"summary_contam_score_rt_delta.png"),
+                                col="delta_mean", title="Enrichment by source (score RT, hits−non‑hits)")
+
+    # ---------- Correlations ----------
+    conf_cols = {}
+    for s in sets:
+        col = f"set_{s}__confusability_simple_mean"
+        if col in feat.columns:
+            conf_cols[f"{s} (S2)"] = feat[col]
+        col2 = f"set_{s}__Confusability_simple__script1"
+        if col2 in feat.columns:
+            conf_cols[f"{s} (S1)"] = feat[col2]
+        col3 = f"set_{s}__contam_score"
+        if col3 in feat.columns:
+            conf_cols[f"{s} (score)"] = feat[col3]
+    conf_df = pd.DataFrame(conf_cols)
+    corr_sets = conf_df.corr().fillna(0.0)
+    save_heatmap(corr_sets, "Correlation across sets (confusability & score)", os.path.join(subdirs["correlations"], "corr_sets.png"))
+
+    # ---------- README with diagnostics ----------
+    alpha = args.alpha
+    diag_lines = ["# WIQD SETS (alone) — Summary & Diagnostics (S1‑aligned + score)",
+                  f"Input peptides: {len(df)} | n(non‑hit)={g0n} | n(hit)={g1n}",
+                  f"Sets evaluated: {', '.join(sets)}", ""]
+    # Top signals table (any feature)
+    diag_lines.append("## Strongest set×metric signals (q<α first, then p)")
+    top = stats_df.sort_values(["q_value","p_value"], na_position="last").head(30)
+    if top.empty:
+        diag_lines.append("(no significant differences)")
+    else:
+        for _, r in top.iterrows():
+            diag_lines.append(f"- {r['feature']}: mean(non-hit)={r['mean_nonhit']:.3g}, mean(hit)={r['mean_hit']:.3g}, p={r['p_value']:.3g}, q={r['q_value']:.3g}")
+
+    # Contamination‑score enrichment summary (all sources)
+    diag_lines.append("\n## Contamination score enrichment by source (hits − non‑hits)")
+    if enrich_df.empty:
+        diag_lines.append("(no score signals)")
+    else:
+        sub = enrich_df[enrich_df["metric"]=="contam_score"].sort_values("delta_mean_hit_minus_non", ascending=False)
+        for _, r in sub.iterrows():
+            diag_lines.append(f"- {SET_FRIENDLY.get(r['set'], r['set'])}: Δmean={r['delta_mean_hit_minus_non']:.3f}, p={r['p_value']:.3g}, q={r['q_value']:.3g}, prev≥0.9 (hit/non)={r['prevalence_score_ge_0_9_hit']:.2f}/{r['prevalence_score_ge_0_9_nonhit']:.2f}")
+
+    # Files guide
+    diag_lines += ["",
+        "## Where to look",
+        "1) `summary_feature_significance.png` — strongest set×metric signals (uncapped −log10 p/q).",
+        "2) `contam_enrichment_summary.csv` — per‑source enrichment with the new [0,1] score (±RT).",
+        "3) Plots:",
+        "   - contamination score: `plots/score/<set>.png` and `<set>_rt.png`",
+        "   - precursor/fragment fractions: `plots/precursor/*.png`, `plots/fragment/*.png`",
+        "   - confusability: `plots/confusability/*.png`",
+        "   - per‑set summary (fractions): `plots/sets/<set>.png`",
+        "   - cross‑set bars: `summary_contam_score_delta.png` and `_rt_*.png`",
+        "4) Overlaps: `set_overlap_matrix.csv` + `plots/overlaps/overlap_accessions.png`.",
+        "",
+        "## New contamination score (definition)",
+        f"- Parameters: good_ppm={args.score_prec_ppm_good:g}, max_ppm={args.score_prec_ppm_max:g}, frag_types_req={args.score_frag_types_req}",
+        "- 1.0 when: ≥1 precursor‑matched window at ≤good_ppm AND ≥frag_types_req b/y fragment types (k=2..7, z=1..3) at ≤good_ppm, chained to those windows.",
+        "- Partial credit when: best precursor ≤max_ppm AND ≥frag_types_req fragment types at ≤max_ppm, scaled by proximity and fragment count.",
+        "- 0 otherwise. RT‑gated variant uses only windows within ±RT tolerance.",
+    ]
+    with open(os.path.join(args.outdir, "README_SETS.md"), "w") as fh:
+        fh.write("\n".join(diag_lines))
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="WIQD — hit vs non‑hit peptide analysis against contaminant SETS (alone; Script‑1‑aligned core + [0,1] score)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--in", dest="input_csv", required=True, help="CSV with peptide,is_hit (or provide --min_score and a score column)")
+    ap.add_argument("--outdir", default="wiqd_sets_out", help="Output directory")
+
+    # Sets
+    ap.add_argument("--sets", type=str,
+                    default="keratins,protease_autolysis,immunoglobulins,transferrin,hemoglobin,apolipoproteins,streptavidin_avidin_birA,protein_A_G,caseins_gelatin,mhc_hardware,albumin,actin_tubulin",
+                    help="Comma‑sep list of SET names to evaluate (alone)")
+    ap.add_argument("--download_sets", action="store_true", help="Fetch SET sequences from UniProt (recommended)")
+    ap.add_argument("--sets_fasta_dir", type=str, default=None, help="Directory of per‑set FASTAs named <set>.fasta")
+    ap.add_argument("--sets_accessions_json", type=str, default=None, help="JSON mapping {set_name: [accessions,...]} to override defaults")
+    ap.add_argument("--split_keratin", action="store_true", help="Split 'keratins' set into one source per accession")
+
+    # Matching controls
+    ap.add_argument("--ppm_tol", type=float, default=30.0, help="PPM tolerance for m/z matching")
+    ap.add_argument("--charges", type=str, default="1,2,3", help="Comma‑sep charge states to test")
+    ap.add_argument("--full_mz_len_min", type=int, default=5, help="Window min length for **precursor** matching")
+    ap.add_argument("--full_mz_len_max", type=int, default=15, help="Window max length for **precursor** matching")
+    ap.add_argument("--fragment_kmin", type=int, default=2, help="Min length of b/y **fragment** (Script‑1) and peptide‑substring (Script‑2) checks")
+    ap.add_argument("--fragment_kmax", type=int, default=7, help="Max length of b/y **fragment** (Script‑1) and peptide‑substring (Script‑2) checks")
+    ap.add_argument("--rt_tolerance_min", type=float, default=1.0, help="RT co‑elution tolerance (minutes)")
+    ap.add_argument("--gradient_min", type=float, default=20.0, help="Assumed gradient length (minutes) in RT surrogate")
+    ap.add_argument("--require_precursor_match_for_fragment", action="store_true",
+                    help="(Script‑2 only) If set, fragment matching only considers windows that ALSO match precursor m/z within tolerance")
+
+    # Chemistry
+    ap.add_argument("--cys_mod", choices=["none","carbamidomethyl"], default="carbamidomethyl",
+                    help="Fixed mod on Cys for mass calc")
+    ap.add_argument("--xle_collapse", action="store_true",
+                    help="Treat I/L as indistinguishable for sequence containment (I/L→J), like Script 1")
+
+    # Score tunables
+    ap.add_argument("--score_prec_ppm_good", type=float, default=20.0, help="Good precursor ppm threshold for score=1")
+    ap.add_argument("--score_prec_ppm_max",  type=float, default=30.0, help="Max precursor ppm to get non‑zero score")
+    ap.add_argument("--score_frag_types_req", type=int, default=3, help="Min # of b/y fragment types at threshold to consider 'several'")
+
+    # Stats & summaries
+    ap.add_argument("--alpha", type=float, default=0.05, help="FDR threshold (for guidance lines/diagnostics)")
+    ap.add_argument("--summary_top_n", type=int, default=24, help="Top‑N features to show in summary plot")
+    ap.add_argument("--min_nnz_topn", type=int, default=4, help="Min nnz per group to include in Top‑N summary")
+    ap.add_argument("--min_score", type=float, default=None, help="If set, derive is_hit = 1[score >= min_score] from a 'score' column")
+    args = ap.parse_args()
+    banner(args=args)
+    run(args)
 
 if __name__ == "__main__":
-    try:
-        from tqdm.auto import tqdm  # noqa: F401
-    except Exception:
-        pass
     main()
-
