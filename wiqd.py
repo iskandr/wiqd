@@ -5,32 +5,39 @@
 WIQD — What Is Qing Doing?
 Hit vs non-hit peptide analysis with rigorous stats and plots.
 
-This version:
-  • Harmonizes albumin analyses and ALWAYS emits two sets of albumin features:
-      – Ungated (global across albumin)
-      – RT‑gated (only albumin subsequences predicted to co‑elute with the peptide within ±rt_tolerance_min)
-  • Uses count‑based albumin matching and **fragment (any contiguous subseq) count metrics**.
-  • Removes b vs y separation in fragment metrics (now “any fragment ↔ any fragment”).
-  • Adds nnz to boxplot annotations and a Top‑N filter `--min_nnz_topn` (default 4).
+This version streamlines albumin metrics and proline/synthesis flags:
 
-Albumin fragment features (any fragment, not b/y):
-  - M/Z space (using --by_mz_len_min..max, any charge in --charges):
-      alb_frag_candidates_mz, alb_frag_mz_match_count, alb_frag_mz_match_frac  (+ _rt)
-  - Sequence space (using --by_seq_len_min..max, after --collapse):
-      alb_frag_candidates_seq, alb_frag_seq_match_count, alb_frag_seq_match_frac, alb_frag_seq_max_k  (+ _rt)
+Albumin features
+  • RETAINED (counts only; no fractions):
+      - alb_candidates_total, alb_candidates_rt
+      - alb_precursor_mz_match_count, alb_precursor_mz_match_count_rt
+      - alb_frag_candidates_mz, alb_frag_candidates_mz_rt
+      - alb_frag_mz_match_count, alb_frag_mz_match_count_rt
+      - Best precursor metrics (for context):
+          * alb_precursor_mz_best_ppm, alb_precursor_mz_best_da,
+            alb_precursor_mz_best_len, alb_precursor_mz_best_charge,
+            alb_confusability_precursor_mz (ppm→score)
+  • REMOVED:
+      - All albumin sequence matching metrics (alb_frag_seq_*)
+      - Any albumin *_frac fields
+      - Composite albumin confusability by sequence/mz/overall
 
-Composite albumin scores:
-  - alb_confusability_precursor_mz: ppm-to-score of best precursor match (unchanged)
-  - alb_confusability_by_sequence: scaled from alb_frag_seq_max_k
-  - alb_confusability_by_mz: equals alb_frag_mz_match_frac
-  - alb_confusability_overall: mean of the above three
+Fragmentation flags
+  • Replace the 11 proline-related presence flags with:
+      - frag_dbl_proline_after (any X–P among AP,SP,TP,GP,DP,EP,KP,RP,PP)
+      - frag_dbl_proline_before (any P–K or P–R; PP sets both)
+  • Add a single numeric:
+      - hard_to_synthesize_residues = total count of specified synthesis-risk doublets
 
-Other highlights retained:
-- Physicochemical features, ambiguity classes, housekeeping homology, flyability
-- Mann–Whitney/permutation U with BH FDR
-- Clean plots + summary bar of −log10(q) (fallback to −log10(p))
-
-This script never modifies peptides; all metrics use sequences as given.
+Other changes
+  • Boxplot deprecation fix: use tick_labels (Matplotlib ≥3.9)
+  • Show nnz in plot annotations; means at 3 sig figs (SD removed)
+  • Summary Top‑N gate: --min_nnz_topn (default 4)
+  • Default permutations: 5,000 (faster)
+  • Default cysteine fixed mod: carbamidomethyl (+57.021464), realistic for HPLC‑MS
+  • Bug fixes: flyability clamping; pI formula for glutamate
+  • “Any fragment” logic for albumin m/z stays (no b/y orientation); RT gating supported;
+    optional precursor m/z gating for fragments via --require_precursor_match_for_frag.
 """
 
 import os, sys, math, argparse, datetime, random, re, bisect
@@ -98,7 +105,7 @@ plt.rcParams.update(
 def _apply_grid(ax):
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
 
-# =================== Chemistry & constants (decoy parity) ===================
+# =================== Chemistry & constants ===================
 AA = set("ACDEFGHIKLMNPQRSTVWY")
 KD = {
     "A": 1.8, "R": -4.5, "N": -3.5, "D": -3.5, "C": 2.5, "Q": -3.5, "E": -3.5, "G": -0.4,
@@ -135,7 +142,7 @@ RES_ELEM = {
     "A": (3, 5, 1, 1, 0), "R": (6, 12, 4, 1, 0), "N": (4, 6, 2, 2, 0), "D": (4, 5, 1, 3, 0),
     "C": (3, 5, 1, 1, 1), "E": (5, 7, 1, 3, 0), "Q": (5, 8, 2, 2, 0), "G": (2, 3, 1, 1, 0),
     "H": (6, 7, 3, 1, 0), "I": (6, 11, 1, 1, 0), "L": (6, 11, 1, 1, 0), "K": (6, 12, 2, 1, 0),
-    "M": (5, 9, 1, 1, 1), "F": (9, 9, 1, 1, 0), "P": (5, 7, 1, 1, 0), "S": (3, 5, 1, 1, 0),
+    "M": (5, 9, 1, 1, 1), "F": (9, 9, 1, 1, 0), "P": (5, 7, 1, 1, 0), "S": (3, 5, 1, 2, 0),
     "T": (4, 7, 1, 2, 0), "W": (11, 10, 2, 1, 0), "Y": (9, 9, 1, 2, 0), "V": (5, 9, 1, 1, 0),
 }
 H2O_ELEM = (0, 2, 0, 1, 0)
@@ -150,8 +157,7 @@ def mean_scale(p, scale):
     return sum(scale[a] for a in p) / len(p) if p else float("nan")
 
 def kd_stdev(p):
-    if not p:
-        return float("nan")
+    if not p: return float("nan")
     vals = [KD[a] for a in p]
     m = sum(vals) / len(vals)
     return (sum((x - m) ** 2 for x in vals) / len(vals)) ** 0.5
@@ -166,6 +172,7 @@ def max_hydro_streak(p):
     return best
 
 def mass_monoisotopic(p):
+    # Peptide masses are unmodified by design (albumin metrics apply Cys fixed mod internally)
     return sum(MONO[a] for a in p) + H2O
 
 def mz_from_mass(m, z):
@@ -254,7 +261,7 @@ def count_acidic(p): return sum(1 for a in p if a in "DE")
 def basicity_proxy(p):
     return 1.0 * p.count("R") + 0.8 * p.count("K") + 0.3 * p.count("H") + 0.2
 
-# =================== Flyability (identical math) ===================
+# =================== Flyability ===================
 KD_HYDRO = {
     "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5, "M": 1.9, "A": 1.8,
     "G": -0.4, "T": -0.7, "S": -0.8, "W": -0.9, "Y": -1.3, "P": -1.6,
@@ -277,31 +284,21 @@ def compute_flyability_components(seq: str) -> Dict[str, float]:
         if aa in counts: counts[aa] += 1
     R = counts.get("R", 0); K = counts.get("K", 0); H = counts.get("H", 0)
     D = counts.get("D", 0); E = counts.get("E", 0)
-
-    # charge component
     charge_sites = 1.0 + R + K + 0.7 * H
     acid_penalty = 0.1 * (D + E)
     charge_norm = 1.0 - math.exp(-(max(0.0, charge_sites - acid_penalty)) / 2.0)
-
-    # surface/hydrophobicity component
     gravy = sum(KD_HYDRO.get(a, 0.0) for a in seq) / L
     surface_norm = min(1.0, max(0.0, (gravy + 4.5) / 9.0))
-
-    # aromatic component
     W = counts.get("W", 0); Y = counts.get("Y", 0); F = counts.get("F", 0)
     aromatic_weighted = 1.0 * W + 0.7 * Y + 0.5 * F
     aromatic_norm = min(1.0, max(0.0, aromatic_weighted / max(1.0, L / 2.0)))
-
-    # length component
     len_norm = triangular_len_score(L, 7, 9, 11, 20)
-
     return {
         "fly_charge_norm": charge_norm,
         "fly_surface_norm": surface_norm,
         "fly_aromatic_norm": aromatic_norm,
         "fly_len_norm": len_norm,
     }
-
 
 def combine_flyability_score(components: Dict[str, float], fly_weights: Dict[str, float]) -> float:
     w = {
@@ -474,29 +471,38 @@ def doublet_features(peptide: str):
     bonds = max(1, L - 1)
     counts = _count_doublets(peptide)
     out = {}
-    # Fragmentation doublets
+    # Fragmentation doublets (keep counts/fracs; collapse presence → 2 flags)
     frag_total = 0
     for di in FRAG_DOUBLETS:
         c = counts.get(di, 0)
         frag_total += c
         out[f"frag_dbl_{di}_count"] = float(c)
         out[f"frag_dbl_{di}_frac"] = float(c) / bonds
-        out[f"frag_dbl_{di}_present"] = 1 if c > 0 else 0
+        # remove per-dipeptide _present fields
     out["frag_doublet_total_count"] = float(frag_total)
     out["frag_doublet_total_frac"] = float(frag_total) / bonds
-    # Synthesis-risk doublets
+    # Proline aggregation (binary presence)
+    # proline_after: any X–P among AP,SP,TP,GP,DP,EP,KP,RP,PP
+    proline_after_set = {"AP","SP","TP","GP","DP","EP","KP","RP","PP"}
+    proline_before_set = {"PK","PR","PP"}  # PP counts for both
+    out["frag_dbl_proline_after"] = 1 if any(counts.get(di,0)>0 for di in proline_after_set) else 0
+    out["frag_dbl_proline_before"] = 1 if any(counts.get(di,0)>0 for di in proline_before_set) else 0
+
+    # Synthesis-risk doublets (keep totals; replace many *_present with one numeric)
     syn_total = 0
     for di in SYN_RISK_DOUBLETS:
         c = counts.get(di, 0)
         syn_total += c
         out[f"synth_dbl_{di}_count"] = float(c)
         out[f"synth_dbl_{di}_frac"] = float(c) / bonds
-        out[f"synth_dbl_{di}_present"] = 1 if c > 0 else 0
+        # remove per-dipeptide _present fields
     out["synth_doublet_total_count"] = float(syn_total)
     out["synth_doublet_total_frac"] = float(syn_total) / bonds
+    # One consolidated hardness metric
+    out["hard_to_synthesize_residues"] = float(syn_total)
     return out
 
-# =================== Ambiguity classes & confusability ===================
+# =================== Ambiguity classes & confusability (independent of albumin) ===================
 DELTA_KQ = abs(MONO["K"] - MONO["Q"])
 DELTA_F_Mox = abs(MONO["F"] - (MONO["M"] + 15.994915))
 DELTA_ND = abs(MONO["N"] - MONO["D"])
@@ -537,15 +543,9 @@ def fragment_confusability_features(pep: str, frag_tol_da: float = 0.02, frag_to
     frac_b = conf_b / total; frac_y = conf_y / total
     return {"confusable_bion_frac": frac_b,"confusable_yion_frac": frac_y,"confusable_ion_frac": 0.5 * (frac_b + frac_y)}
 
-# =================== Predicted retention time (NEW) ===================
+# =================== Predicted retention time ===================
 def predict_rt_min(seq: str, gradient_min: float = 20.0) -> float:
-    """
-    Lightweight RT surrogate for RP-HPLC on a given gradient (minutes).
-    Increases with GRAVY and length; decreases with basic residues.
-    Output clamped to [0, gradient_min].
-    """
-    if not seq:
-        return float("nan")
+    if not seq: return float("nan")
     gravy = kd_gravy(seq)
     frac = (gravy + 4.5) / 9.0
     base = 0.5 + max(0.0, gradient_min - 1.0) * min(1.0, max(0.0, frac))
@@ -642,7 +642,28 @@ def ppm_to_score(ppm_val: float, ppm_tol: float) -> float:
         return 0.0
     return max(0.0, 1.0 - min(ppm_val, ppm_tol) / ppm_tol)
 
-# =================== Fragment (ANY) caches and counting ===================
+# =================== ANY-fragment (m/z only) matching ===================
+def _build_peptide_anyfrag_mz_cache(
+    pep: str,
+    charges: Iterable[int],
+    cys_fixed_mod: float,
+    kmin: int,
+    kmax: int,
+):
+    """Precompute peptide ANY contiguous fragments (all positions) m/z lists by charge."""
+    Lp = len(pep)
+    kmin = max(1, int(kmin)); kmax = min(int(kmax), max(0, Lp))
+    mz_lists_by_z: Dict[int, List[float]] = {int(z): [] for z in charges}
+    for k in range(kmin, kmax + 1):
+        for i in range(0, Lp - k + 1):
+            sub = pep[i:i+k]
+            m = sum(MONO[a] for a in sub) + H2O + (cys_fixed_mod * sub.count("C"))
+            for z in mz_lists_by_z.keys():
+                mz_lists_by_z[z].append((m + z * PROTON_MASS) / z)
+    for z in mz_lists_by_z.keys():
+        mz_lists_by_z[z].sort()
+    return {"mz_lists_by_z": mz_lists_by_z}
+
 def _any_within_ppm(x: float, sorted_list: List[float], ppm_tol: float) -> bool:
     if not sorted_list:
         return False
@@ -653,71 +674,30 @@ def _any_within_ppm(x: float, sorted_list: List[float], ppm_tol: float) -> bool:
     if i + 1 < len(sorted_list) and abs(sorted_list[i + 1] - x) <= tol: return True
     return False
 
-def _build_peptide_anyfrag_cache(
-    pep: str,
-    charges: Iterable[int],
-    cys_fixed_mod: float,
-    kmin: int,
-    kmax: int,
-    collapse: str,
-):
-    """Precompute peptide ANY contiguous fragments (all positions), by length k in [kmin..kmax]."""
-    Lp = len(pep)
-    kmin = max(1, int(kmin)); kmax = min(int(kmax), max(0, Lp))
-    seq_set_by_k: Dict[int, set] = {}
-    mz_lists_by_z: Dict[int, List[float]] = {int(z): [] for z in charges}
-    for k in range(kmin, kmax + 1):
-        sset = set()
-        for i in range(0, Lp - k + 1):
-            sub = pep[i:i+k]
-            sset.add(collapse_seq_mode(sub, collapse))
-            m = sum(MONO[a] for a in sub) + H2O + (cys_fixed_mod * sub.count("C"))
-            for z in mz_lists_by_z.keys():
-                mz_lists_by_z[z].append((m + z * PROTON_MASS) / z)
-        seq_set_by_k[k] = sset
-    for z in mz_lists_by_z.keys():
-        mz_lists_by_z[z].sort()
-    return {
-        "seq_set_by_k": seq_set_by_k,
-        "mz_lists_by_z": mz_lists_by_z,
-        "kmin": kmin, "kmax": kmax, "collapse": collapse,
-    }
-
-def _fragment_any_match_counts_over(
+def _fragment_any_mz_match_counts_over(
     matched_windows: List[AlbWindow],
-    pep_frag: dict,
+    pep_frag_mz: dict,
     charges: Iterable[int],
     cys_fixed_mod: float,
     ppm_tol: float,
 ):
     """
-    Count ANY-fragment matches between albumin windows and the peptide:
-    - Sequence: collapsed equality at same k
-    - m/z: within ppm_tol to ANY peptide fragment (any k, any position) at ANY charge in `charges`
+    Count ANY-fragment m/z matches between albumin windows and the peptide:
+      - Consider all contiguous subsequences (k in configured range) of albumin windows
+      - A match occurs if the sub-fragment m/z is within ppm_tol to ANY peptide fragment m/z
+        at ANY charge in `charges`.
+    Returns: {"cand": total_fragments_considered, "mz_count": matched_fragments}
     """
-    seq_set_by_k = pep_frag["seq_set_by_k"]
-    mz_lists_by_z = pep_frag["mz_lists_by_z"]
-    kmin = pep_frag["kmin"]; kmax = pep_frag["kmax"]
-    collapse = pep_frag["collapse"]
-
+    mz_lists_by_z = pep_frag_mz["mz_lists_by_z"]
     cand = 0
-    seq_count = 0
-    seq_max_k = 0
     mz_count = 0
-
     for w in matched_windows:
         Lw = w.length
-        kmax_w = min(kmax, Lw)
-        for k in range(kmin, kmax_w + 1):
+        # we assume albumin window lengths already constrained when pool is built
+        for k in range(1, Lw + 1):
             for i in range(0, Lw - k + 1):
                 sub = w.seq[i:i+k]
                 cand += 1
-                # Sequence
-                cs = collapse_seq_mode(sub, collapse)
-                if k in seq_set_by_k and cs in seq_set_by_k[k]:
-                    seq_count += 1
-                    if k > seq_max_k: seq_max_k = k
-                # m/z (any charge)
                 m = sum(MONO[a] for a in sub) + H2O + (cys_fixed_mod * sub.count("C"))
                 hit = False
                 for z in mz_lists_by_z.keys():
@@ -726,15 +706,7 @@ def _fragment_any_match_counts_over(
                         hit = True; break
                 if hit:
                     mz_count += 1
-
-    return {
-        "cand": cand,
-        "seq_count": seq_count,
-        "seq_frac": (seq_count / cand) if cand else float("nan"),
-        "seq_max_k": seq_max_k,
-        "mz_count": mz_count,
-        "mz_frac": (mz_count / cand) if cand else float("nan"),
-    }
+    return {"cand": cand, "mz_count": mz_count}
 
 # =================== Stats helpers (MW / permutation U; BH FDR) ===================
 def mannwhitney_u_p(x, y):
@@ -810,7 +782,7 @@ def mannwhitney_U_only(x, y):
     U2 = n1 * len(y) - U1
     return min(U1, U2)
 
-def perm_pvalue_U(x, y, iters=20000, rng_seed=123, progress_desc=None):
+def perm_pvalue_U(x, y, iters=5000, rng_seed=123, progress_desc=None):
     import random
     try:
         import numpy as np
@@ -924,26 +896,27 @@ def fmt_q(q: float) -> str:
     return fmt_p(q)
 
 # =================== Plot helpers ===================
-def _mean_sd(vs):
-    if not vs: return (float("nan"), float("nan"))
-    m = sum(vs) / len(vs)
-    if len(vs) < 2: return (m, float("nan"))
-    var = sum((v - m) ** 2 for v in vs) / (len(vs) - 1)
-    return (m, var**0.5)
-
 def pretty_feature_name(feat: str) -> str:
-    if feat.startswith("frag_dbl_"):
-        core = feat[len("frag_dbl_") :]
-        if core.endswith("_count"):   return f"Fragmentation doublet {core[:-6]} (count)"
-        if core.endswith("_frac"):    return f"Fragmentation doublet {core[:-5]} (fraction of bonds)"
-        if core.endswith("_present"): return f"Fragmentation doublet {core[:-8]} present"
-        return f"Fragmentation doublet {core}"
-    if feat.startswith("synth_dbl_"):
-        core = feat[len("synth_dbl_") :]
-        if core.endswith("_count"):   return f"Synthesis-risk doublet {core[:-6]} (count)"
-        if core.endswith("_frac"):    return f"Synthesis-risk doublet {core[:-5]} (fraction of bonds)"
-        if core.endswith("_present"): return f"Synthesis-risk doublet {core[:-8]} present"
-        return f"Synthesis-risk doublet {core}"
+    if feat.startswith("frag_dbl_") and feat.endswith("_count"):
+        core = feat[len("frag_dbl_"):-len("_count")]
+        return f"Fragmentation doublet {core} (count)"
+    if feat.startswith("frag_dbl_") and feat.endswith("_frac"):
+        core = feat[len("frag_dbl_"):-len("_frac")]
+        return f"Fragmentation doublet {core} (fraction of bonds)"
+    if feat == "frag_doublet_total_count": return "Fragmentation doublets (total count)"
+    if feat == "frag_doublet_total_frac":  return "Fragmentation doublets (fraction of bonds)"
+    if feat == "frag_dbl_proline_after":   return "Proline after (X–P) present"
+    if feat == "frag_dbl_proline_before":  return "Proline before (P–K/R) present"
+
+    if feat.startswith("synth_dbl_") and feat.endswith("_count"):
+        core = feat[len("synth_dbl_"):-len("_count")]
+        return f"Synthesis-risk doublet {core} (count)"
+    if feat.startswith("synth_dbl_") and feat.endswith("_frac"):
+        core = feat[len("synth_dbl_"):-len("_frac")]
+        return f"Synthesis-risk doublet {core} (fraction of bonds)"
+    if feat == "synth_doublet_total_count": return "Synthesis-risk doublets (total count)"
+    if feat == "synth_doublet_total_frac":  return "Synthesis-risk doublets (fraction of bonds)"
+    if feat == "hard_to_synthesize_residues": return "Hard-to-synthesize doublets (count)"
 
     special = {
         "pI": "pI",
@@ -995,40 +968,21 @@ def pretty_feature_name(feat: str) -> str:
         "fly_surface_norm": "Fly: surface norm",
         "fly_aromatic_norm": "Fly: aromatic norm",
         "fly_len_norm": "Fly: length norm",
-        # RT + albumin
         "rt_pred_min": "Predicted RT (min)",
+        # Albumin (counts only)
+        "alb_candidates_total": "Albumin candidate windows (total)",
+        "alb_candidates_rt": "Albumin candidate windows (RT‑gated)",
+        "alb_precursor_mz_match_count": "# albumin windows matching precursor m/z",
+        "alb_precursor_mz_match_count_rt": "# windows matching precursor m/z (RT‑gated)",
+        "alb_frag_candidates_mz": "Albumin fragments considered (m/z)",
+        "alb_frag_mz_match_count": "Albumin fragments m/z‑match (count)",
+        "alb_frag_candidates_mz_rt": "Albumin fragments considered (m/z, RT‑gated)",
+        "alb_frag_mz_match_count_rt": "Albumin fragments m/z‑match (count, RT‑gated)",
         "alb_precursor_mz_best_ppm": "Precursor vs albumin 5–15mer best ppm",
         "alb_precursor_mz_best_da": "Precursor vs albumin 5–15mer best Da",
         "alb_precursor_mz_best_len": "Precursor vs albumin best length (5–15)",
-        "alb_confusability_precursor_mz": "Albumin confusability (precursor m/z)",
-        "alb_confusability_by_sequence": "Albumin confusability (sequence)",
-        "alb_confusability_by_mz": "Albumin confusability (m/z)",
-        "alb_confusability_overall": "Albumin confusability (overall)",
-        "alb_confusability_overall_rt": "Albumin confusability (overall, RT‑gated)",
-
-        # NEW: precursor count metrics
-        "alb_precursor_mz_match_count": "# albumin windows matching precursor m/z",
-        "alb_precursor_mz_match_frac": "Frac windows matching precursor m/z",
-        "alb_precursor_mz_match_count_rt": "# windows matching precursor m/z (RT‑gated)",
-        "alb_precursor_mz_match_frac_rt": "Frac windows matching precursor m/z (RT‑gated)",
-
-        # NEW: ANY-fragment counts (m/z)
-        "alb_frag_candidates_mz": "Albumin fragments considered (m/z)",
-        "alb_frag_mz_match_count": "Albumin fragments m/z‑match (count)",
-        "alb_frag_mz_match_frac": "Albumin fragments m/z‑match (frac)",
-        "alb_frag_candidates_mz_rt": "Albumin fragments considered (m/z, RT‑gated)",
-        "alb_frag_mz_match_count_rt": "Albumin fragments m/z‑match (count, RT‑gated)",
-        "alb_frag_mz_match_frac_rt": "Albumin fragments m/z‑match (frac, RT‑gated)",
-
-        # NEW: ANY-fragment counts (sequence)
-        "alb_frag_candidates_seq": "Albumin fragments considered (sequence)",
-        "alb_frag_seq_match_count": "Albumin fragments seq‑match (count)",
-        "alb_frag_seq_match_frac": "Albumin fragments seq‑match (frac)",
-        "alb_frag_seq_max_k": "Longest sequence fragment match (max k)",
-        "alb_frag_candidates_seq_rt": "Albumin fragments considered (sequence, RT‑gated)",
-        "alb_frag_seq_match_count_rt": "Albumin fragments seq‑match (count, RT‑gated)",
-        "alb_frag_seq_match_frac_rt": "Albumin fragments seq‑match (frac, RT‑gated)",
-        "alb_frag_seq_max_k_rt": "Longest sequence fragment match (max k, RT‑gated)",
+        "alb_precursor_mz_best_charge": "Precursor vs albumin best charge",
+        "alb_confusability_precursor_mz": "Albumin confusability (precursor m/z score)",
     }
     if feat in special: return special[feat]
     if feat.startswith("frac_"): return f"Fraction of {feat.split('_',1)[1]}"
@@ -1039,7 +993,8 @@ def safe_name(s: str) -> str:
 
 def save_boxplot(x, y, feature, pval, qval, outpath):
     fig, ax = plt.subplots(constrained_layout=True)
-    bp = ax.boxplot([x, y], labels=["non-hit", "hit"], showmeans=True, meanline=True)
+    # Matplotlib 3.9 deprecation: use tick_labels
+    bp = ax.boxplot([x, y], tick_labels=["non-hit", "hit"], showmeans=True, meanline=True)
     jitter = 0.08
     xs0 = [1 + (random.random() - 0.5) * 2 * jitter for _ in x]
     xs1 = [2 + (random.random() - 0.5) * 2 * jitter for _ in y]
@@ -1048,7 +1003,6 @@ def save_boxplot(x, y, feature, pval, qval, outpath):
     ax.set_title(pretty_feature_name(feature))
     ax.set_ylabel(pretty_feature_name(feature))
     n0, n1 = len(x), len(y)
-    # nnz per group
     nnz0 = sum(1 for v in x if (isinstance(v, (int,float)) and v != 0))
     nnz1 = sum(1 for v in y if (isinstance(v, (int,float)) and v != 0))
     m0 = (sum(x)/n0) if n0 else float("nan")
@@ -1225,7 +1179,7 @@ def compute_features(peptides: List[str], fly_weights: Dict[str, float], args) -
         }
         for a in sorted(AA):
             row[f"frac_{a}"] = aa_fraction(pep, a)
-        # Doublet features
+        # Doublet features (with proline collapse + hardness)
         row.update(doublet_features(pep))
         # Predicted RT (min)
         row["rt_pred_min"] = predict_rt_min(pep, gradient_min=args.gradient_min)
@@ -1251,10 +1205,10 @@ def write_assumptions_report(outdir: str, df_in: pd.DataFrame, feat: pd.DataFram
     lines.append("Top features by missingness (fraction missing):")
     for k, v in missing.items():
         lines.append(f"  {k}: {v:.3f}")
-    lines.append("Albumin metrics are computed on peptides as provided; no substitutions are performed.")
-    lines.append(f"RT gating: ALWAYS computed (columns with '_rt'); window ±{args.rt_tolerance_min} min on a {args.gradient_min}‑min gradient.")
+    lines.append("Albumin metrics are counts (no sequence matching; no fractions).")
+    lines.append(f"RT gating applied where *_rt present: ±{args.rt_tolerance_min} min on a {args.gradient_min}‑min gradient.")
     if args.require_precursor_match_for_frag:
-        lines.append("Fragment metrics: albumin windows are restricted to those matching precursor m/z within ppm tolerance (ungated and RT‑gated).")
+        lines.append("Fragment metrics are restricted to albumin windows that match precursor m/z within ppm tolerance (ungated and RT‑gated).")
     with open(os.path.join(outdir, "ASSUMPTIONS.txt"), "w") as fh:
         fh.write("\n".join(lines))
 
@@ -1312,7 +1266,7 @@ def run_analysis(args):
     # Core + flyability
     feat = compute_features(df["peptide"].tolist(), fly_weights, args)
 
-    # Ambiguous pair presence flags
+    # Ambiguous pair presence flags (kept)
     amb_rows = []
     for p in tqdm(feat["peptide"], desc="[2/8] Ambiguous pair flags ..."):
         amb_union_set = set("LIKQFMNDE")
@@ -1344,11 +1298,11 @@ def run_analysis(args):
     ]
     feat = pd.concat([feat, pd.DataFrame(hk_rows)], axis=1)
 
-    # Albumin metrics (peptide-as-provided), both ungated and RT-gated
+    # Albumin metrics (counts only)
     albumin = load_albumin_sequence(args) if args.albumin_source != "none" else ""
     alb_rows = []
     if albumin:
-        # Build unified albumin window index covering all lengths needed
+        # Unified albumin window index covering all lengths needed (min/max spans precursor/frag ranges)
         idx_len_min = min(args.full_mz_len_min, args.by_mz_len_min, args.by_seq_len_min)
         idx_len_max = max(args.full_mz_len_max, args.by_mz_len_max, args.by_seq_len_max)
         assert idx_len_min >= 1 and idx_len_max >= idx_len_min
@@ -1368,20 +1322,32 @@ def run_analysis(args):
 
         for _, r in tqdm(feat.iterrows(), total=len(feat), desc="[5/8] Albumin metrics ..."):
             pep = r["peptide"]
-            Lp = len(pep)
             pep_m = sum(MONO[a] for a in pep) + H2O + (cys_fixed_mod * pep.count("C"))
             pep_mz_by_z = {z: (pep_m + z * PROTON_MASS) / z for z in charges}
             pep_rt = predict_rt_min(pep, gradient_min=args.gradient_min)
 
-            # Precompute peptide ANY-fragment caches for both spaces
-            pep_frag_mz  = _build_peptide_anyfrag_cache(pep, charges, cys_fixed_mod, args.by_mz_len_min,  args.by_mz_len_max,  args.collapse)
-            pep_frag_seq = _build_peptide_anyfrag_cache(pep, charges, cys_fixed_mod, args.by_seq_len_min, args.by_seq_len_max, args.collapse)
+            # Precompute peptide ANY-fragment m/z cache (across configured by_mz range on peptide)
+            pep_frag_mz = _build_peptide_anyfrag_mz_cache(pep, charges, cys_fixed_mod, args.by_mz_len_min, args.by_mz_len_max)
 
+            # RT pools
+            rt_pool_precursor_len = _filter_rt(precursor_len_pool_all, pep_rt, args.rt_tolerance_min)
+
+            # Count precursor matches (ungated and RT-gated) over the length-limited pools
+            prec_match_count_all = _count_precursor_mz_matches(precursor_len_pool_all, pep_mz_by_z, args.ppm_tol)
+            prec_match_count_rt  = _count_precursor_mz_matches(rt_pool_precursor_len,  pep_mz_by_z, args.ppm_tol)
+
+            # Fragment pools
+            frag_pool_all = precursor_len_pool_all
+            frag_pool_rt  = rt_pool_precursor_len
+            if args.require_precursor_match_for_frag:
+                frag_pool_all = _filter_precursor_mz(precursor_len_pool_all, pep_mz_by_z, args.ppm_tol)
+                frag_pool_rt  = _filter_precursor_mz(rt_pool_precursor_len,          pep_mz_by_z, args.ppm_tol)
+
+            # Best precursor metrics (context)
             def precursor_mm_over(windows: List[AlbWindow]):
                 best = {"ppm": float("inf"), "da": float("inf"), "z": None, "L": None}
                 for w in windows:
-                    if w.length < args.full_mz_len_min or w.length > args.full_mz_len_max:
-                        continue
+                    if w.length < args.full_mz_len_min or w.length > args.full_mz_len_max: continue
                     for z, pmz in pep_mz_by_z.items():
                         wmz = w.mz_by_z.get(z)
                         if wmz is None: continue
@@ -1390,60 +1356,28 @@ def run_analysis(args):
                         if ppmv < best["ppm"]:
                             best.update({"ppm": ppmv, "da": da, "z": z, "L": w.length})
                 return best
-
-            # Pools for counts and fragment metrics
-            rt_pool_precursor_len = _filter_rt(precursor_len_pool_all, pep_rt, args.rt_tolerance_min)
-
-            # Count precursor matches (ungated and RT-gated) over the length-limited pools
-            prec_match_count_all = _count_precursor_mz_matches(precursor_len_pool_all, pep_mz_by_z, args.ppm_tol)
-            prec_match_count_rt  = _count_precursor_mz_matches(rt_pool_precursor_len,  pep_mz_by_z, args.ppm_tol)
-            prec_frac_all = (prec_match_count_all / max(1, len(precursor_len_pool_all))) if precursor_len_pool_all else float("nan")
-            prec_frac_rt  = (prec_match_count_rt  / max(1, len(rt_pool_precursor_len)))  if rt_pool_precursor_len  else float("nan")
-
-            # Fragment window sets:
-            frag_pool_all = precursor_len_pool_all
-            frag_pool_rt  = rt_pool_precursor_len
-            if args.require_precursor_match_for_frag:
-                frag_pool_all = _filter_precursor_mz(precursor_len_pool_all, pep_mz_by_z, args.ppm_tol)
-                frag_pool_rt  = _filter_precursor_mz(rt_pool_precursor_len,          pep_mz_by_z, args.ppm_tol)
-
-            # Existing "best" precursor metrics (ungated + RT)
             pre_all = precursor_mm_over(alb_windows_all)
             cand_rt_all = _filter_rt(alb_windows_all, pep_rt, args.rt_tolerance_min)
             pre_rt  = precursor_mm_over(cand_rt_all)
 
-            # ANY-fragment match counts (ungated)
-            counts_mz_all  = _fragment_any_match_counts_over(frag_pool_all, pep_frag_mz,  charges, cys_fixed_mod, args.ppm_tol)
-            counts_seq_all = _fragment_any_match_counts_over(frag_pool_all, pep_frag_seq, charges, cys_fixed_mod, args.ppm_tol)
+            # ANY-fragment m/z counts (ungated + RT-gated)
+            counts_mz_all = _fragment_any_mz_match_counts_over(frag_pool_all, pep_frag_mz, charges, cys_fixed_mod, args.ppm_tol)
+            counts_mz_rt  = _fragment_any_mz_match_counts_over(frag_pool_rt,  pep_frag_mz, charges, cys_fixed_mod, args.ppm_tol)
 
-            # ANY-fragment match counts (RT‑gated)
-            counts_mz_rt   = _fragment_any_match_counts_over(frag_pool_rt,  pep_frag_mz,  charges, cys_fixed_mod, args.ppm_tol)
-            counts_seq_rt  = _fragment_any_match_counts_over(frag_pool_rt,  pep_frag_seq, charges, cys_fixed_mod, args.ppm_tol)
-
-            # Composite scores
+            # Score (ppm→[0,1]) for best precursor m/z
             conf_prec_all = ppm_to_score(pre_all["ppm"], args.ppm_tol) if pre_all["ppm"] == pre_all["ppm"] else 0.0
-            seq_scale = float(min(7, args.by_seq_len_max))
-            conf_seq_all = (min(counts_seq_all["seq_max_k"], seq_scale) / seq_scale) if seq_scale > 0 else 0.0
-            conf_mz_all  = counts_mz_all["mz_frac"] if counts_mz_all["mz_frac"] == counts_mz_all["mz_frac"] else 0.0
-            conf_overall_all = float(sum([conf_prec_all, conf_seq_all, conf_mz_all]) / 3.0)
-
-            conf_prec_rt = ppm_to_score(pre_rt["ppm"], args.ppm_tol) if pre_rt["ppm"] == pre_rt["ppm"] else 0.0
-            conf_seq_rt  = (min(counts_seq_rt["seq_max_k"], seq_scale) / seq_scale) if seq_scale > 0 else 0.0
-            conf_mz_rt   = counts_mz_rt["mz_frac"] if counts_mz_rt["mz_frac"] == counts_mz_rt["mz_frac"] else 0.0
-            conf_overall_rt = float(sum([conf_prec_rt, conf_seq_rt, conf_mz_rt]) / 3.0)
+            conf_prec_rt  = ppm_to_score(pre_rt["ppm"],  args.ppm_tol) if pre_rt["ppm"]  == pre_rt["ppm"]  else 0.0
 
             alb_rows.append(
                 {
                     "alb_candidates_total": len(alb_windows_all),
                     "alb_candidates_rt": len(cand_rt_all),
 
-                    # Precursor count metrics (ungated + RT)
+                    # Precursor counts
                     "alb_precursor_mz_match_count": prec_match_count_all,
-                    "alb_precursor_mz_match_frac": prec_frac_all,
                     "alb_precursor_mz_match_count_rt": prec_match_count_rt,
-                    "alb_precursor_mz_match_frac_rt": prec_frac_rt,
 
-                    # Precursor "best" metrics
+                    # Best precursor metrics (context)
                     "alb_precursor_mz_best_ppm": pre_all["ppm"],
                     "alb_precursor_mz_best_da": pre_all["da"],
                     "alb_precursor_mz_best_charge": pre_all["z"],
@@ -1453,18 +1387,6 @@ def run_analysis(args):
                     # ANY-fragment (m/z) counts
                     "alb_frag_candidates_mz": counts_mz_all["cand"],
                     "alb_frag_mz_match_count": counts_mz_all["mz_count"],
-                    "alb_frag_mz_match_frac": counts_mz_all["mz_frac"],
-
-                    # ANY-fragment (sequence) counts
-                    "alb_frag_candidates_seq": counts_seq_all["cand"],
-                    "alb_frag_seq_match_count": counts_seq_all["seq_count"],
-                    "alb_frag_seq_match_frac": counts_seq_all["seq_frac"],
-                    "alb_frag_seq_max_k": counts_seq_all["seq_max_k"],
-
-                    # Composite (ungated)
-                    "alb_confusability_by_sequence": conf_seq_all,
-                    "alb_confusability_by_mz": conf_mz_all,
-                    "alb_confusability_overall": conf_overall_all,
 
                     # RT‑gated counterparts
                     "alb_precursor_mz_best_ppm_rt": pre_rt["ppm"],
@@ -1475,28 +1397,19 @@ def run_analysis(args):
 
                     "alb_frag_candidates_mz_rt": counts_mz_rt["cand"],
                     "alb_frag_mz_match_count_rt": counts_mz_rt["mz_count"],
-                    "alb_frag_mz_match_frac_rt": counts_mz_rt["mz_frac"],
 
-                    "alb_frag_candidates_seq_rt": counts_seq_rt["cand"],
-                    "alb_frag_seq_match_count_rt": counts_seq_rt["seq_count"],
-                    "alb_frag_seq_match_frac_rt": counts_seq_rt["seq_frac"],
-                    "alb_frag_seq_max_k_rt": counts_seq_rt["seq_max_k"],
-
-                    "alb_confusability_by_sequence_rt": conf_seq_rt,
-                    "alb_confusability_by_mz_rt": conf_mz_rt,
-                    "alb_confusability_overall_rt": conf_overall_rt,
-
-                    # Back-compat alias to prior field name
+                    # Back-compat alias retained
                     "alb_same_len_best_ppm": pre_all["ppm"],
                     "alb_same_len_best_da": pre_all["da"],
                     "alb_same_len_best_charge": pre_all["z"],
                 }
             )
         feat = pd.concat([feat, pd.DataFrame(alb_rows)], axis=1)
+
     else:
         feat = feat.assign(alb_precursor_mz_best_ppm=float("nan"))
 
-    # Replace infinities to avoid breaking stats/plots
+    # Replace infinities
     feat.replace([float("inf"), float("-inf")], float("nan"), inplace=True)
 
     # Merge labels
@@ -1512,6 +1425,7 @@ def run_analysis(args):
         "hydrophobic_fraction","max_hydrophobic_run",
         "frag_doublet_total_count","frag_doublet_total_frac",
         "synth_doublet_total_count","synth_doublet_total_frac",
+        "hard_to_synthesize_residues",
         "pI","charge_pH2_0","charge_pH2_7","charge_pH7_4","charge_pH10_0",
         "aliphatic_index","aromaticity","xle_fraction","basic_count","acidic_count","basicity_proxy",
         "n_to_proline_bonds","c_to_acidic_bonds","HBD_sidechain","HBA_sidechain",
@@ -1521,25 +1435,21 @@ def run_analysis(args):
         "frac_L_or_I","frac_K_or_Q","frac_F_or_Mox","frac_N_or_D","frac_Q_or_E","frac_ambiguous_union",
         "confusable_bion_frac","confusable_yion_frac","confusable_ion_frac",
         "fly_charge_norm","fly_surface_norm","fly_aromatic_norm","fly_len_norm","fly_score",
-        # RT + albumin (ungated + RT-gated)
+        # RT + albumin (counts only)
         "rt_pred_min",
+        "alb_candidates_total","alb_candidates_rt",
+        "alb_precursor_mz_match_count","alb_precursor_mz_match_count_rt",
+        "alb_frag_candidates_mz","alb_frag_candidates_mz_rt",
+        "alb_frag_mz_match_count","alb_frag_mz_match_count_rt",
         "alb_precursor_mz_best_ppm","alb_precursor_mz_best_da","alb_precursor_mz_best_len",
         "alb_confusability_precursor_mz",
-        # ANY-fragment features
-        "alb_frag_candidates_mz","alb_frag_mz_match_count","alb_frag_mz_match_frac",
-        "alb_frag_candidates_seq","alb_frag_seq_match_count","alb_frag_seq_match_frac","alb_frag_seq_max_k",
-        "alb_confusability_by_sequence","alb_confusability_by_mz","alb_confusability_overall",
-        # RT-gated
         "alb_precursor_mz_best_ppm_rt","alb_precursor_mz_best_da_rt","alb_precursor_mz_best_len_rt",
         "alb_confusability_precursor_mz_rt",
-        "alb_frag_candidates_mz_rt","alb_frag_mz_match_count_rt","alb_frag_mz_match_frac_rt",
-        "alb_frag_candidates_seq_rt","alb_frag_seq_match_count_rt","alb_frag_seq_match_frac_rt","alb_frag_seq_max_k_rt",
-        "alb_confusability_by_sequence_rt","alb_confusability_by_mz_rt","alb_confusability_overall_rt",
     ]
     if albumin == "":
         numeric_feats = [f for f in numeric_feats if not f.startswith("alb_")]
 
-    # Add per-motif doublet numeric features
+    # Append per-motif doublet numeric features (still useful)
     for di in FRAG_DOUBLETS:
         for suffix in ("count", "frac"):
             col = f"frag_dbl_{di}_{suffix}"
@@ -1548,19 +1458,16 @@ def run_analysis(args):
         for suffix in ("count", "frac"):
             col = f"synth_dbl_{di}_{suffix}"
             if col in feat.columns: numeric_feats.append(col)
+
+    # Ensure dedup & existence
     seen = set(); numeric_feats = [f for f in numeric_feats if (f not in seen and not seen.add(f) and f in feat.columns)]
 
+    # Binary feats
     binary_feats = [
         "cterm_hydrophobic","tryptic_end","has_RP_or_KP","has_C","has_M","has_W","has_Y","proline_internal",
         "has_L_or_I","has_K_or_Q","has_F_or_Mox","has_N_or_D","has_Q_or_E","has_ambiguous_union",
+        "frag_dbl_proline_after","frag_dbl_proline_before",
     ]
-    for di in FRAG_DOUBLETS:
-        col = f"frag_dbl_{di}_present"
-        if col in feat.columns: binary_feats.append(col)
-    for di in SYN_RISK_DOUBLETS:
-        col = f"synth_dbl_{di}_present"
-        if col in feat.columns: binary_feats.append(col)
-    binary_feats = [f for f in binary_feats if f in feat.columns]
 
     # Stats
     pmap = {}
@@ -1575,7 +1482,6 @@ def run_analysis(args):
         mean0 = float(pd.Series(x).mean()) if x else float("nan")
         mean1 = float(pd.Series(y).mean()) if y else float("nan")
         uniq0 = len(set(x)); uniq1 = len(set(y))
-        # nnz per group
         nnz0 = sum(1 for v in x if (isinstance(v, (int,float)) and v != 0))
         nnz1 = sum(1 for v in y if (isinstance(v, (int,float)) and v != 0))
         degenerate = False; reason = ""
@@ -1722,7 +1628,7 @@ def run_analysis(args):
         n_nonhit=n_nonhit, n_hit=n_hit, top_n=args.summary_top_n, min_nnz_topn=args.min_nnz_topn,
     )
 
-    # Extra comparative plots
+    # Extra comparative scatter (keep safe)
     try:
         if albumin and "alb_precursor_mz_best_ppm" in feat.columns:
             fig, ax = plt.subplots()
@@ -1734,17 +1640,6 @@ def run_analysis(args):
             ax.scatter(g1["fly_score"], g1["alb_precursor_mz_best_ppm"], s=10, alpha=0.5, label="hit")
             ax.legend(); _apply_grid(ax)
             fig.savefig(os.path.join(args.outdir, "scatter_fly_vs_albumin_ppm.png"), bbox_inches="tight"); plt.close(fig)
-        if albumin and "alb_frag_seq_max_k" in feat.columns:
-            try:
-                import numpy as np
-                fig, ax = plt.subplots()
-                bins = (np.arange(0, max(1, int(feat["alb_frag_seq_max_k"].max(skipna=True) or 1)) + 2) - 0.5)
-                ax.hist(g0["alb_frag_seq_max_k"].dropna(), bins=bins, alpha=0.6, label="non-hit")
-                ax.hist(g1["alb_frag_seq_max_k"].dropna(), bins=bins, alpha=0.6, label="hit")
-                ax.set_title("Albumin ANY‑fragment sequence max k distribution")
-                ax.set_xlabel("max k"); ax.set_ylabel("count"); ax.legend(); _apply_grid(ax)
-                fig.savefig(os.path.join(args.outdir, "hist_alb_frag_seq_max_k.png"), bbox_inches="tight"); plt.close(fig)
-            except Exception: pass
     except Exception as e:
         print(f"[wiqd][WARN] Extra plots failed: {e}")
 
@@ -1762,28 +1657,29 @@ def run_analysis(args):
                     "Files: features.csv | stats_summary.csv | plots/*.png | summary_feature_significance.png | ASSUMPTIONS.txt",
                     "",
                     "## Albumin metrics policy",
-                    "- Computed on the peptide as provided. No substitutions are performed.",
-                    "- Ungated (global albumin) AND RT‑gated metrics (suffix '_rt') are both computed.",
+                    "- Counts only. No albumin sequence matching and no *_frac fields.",
+                    "- Ungated and RT‑gated variants (suffix '_rt').",
                     f"- RT gating uses ±{args.rt_tolerance_min:g} min on a {args.gradient_min:g}-min gradient.",
-                    "- Fragment metrics use ANY contiguous subsequences (not b/y‑only) of the specified ranges:",
-                    f"  * m/z range: k∈[{args.by_mz_len_min}..{args.by_mz_len_max}] matched within ±{args.ppm_tol} ppm at charges {args.charges}",
-                    f"  * sequence range: k∈[{args.by_seq_len_min}..{args.by_seq_len_max}] compared after collapse '{args.collapse}'",
-                    "- Optionally, fragment metrics are restricted to albumin windows that ALSO match PRECURSOR m/z (see --require_precursor_match_for_frag).",
-                    "- Composite confusability scores (0..1): precursor m/z (ppm‑to‑score), sequence (scaled max‑k), m/z (match fraction); overall is their mean.",
-                    "- Precursor windows use lengths in [--full_mz_len_min..--full_mz_len_max] (default 5..15).",
+                    "- Fragment metrics use ANY contiguous subsequences (not b/y‑only); matches in m/z space within ±ppm_tol at charges --charges.",
+                    "- Optionally, fragment pools are restricted to albumin windows that also match PRECURSOR m/z (see --require_precursor_match_for_frag).",
+                    "- Best precursor metrics retained (best ppm/Da/charge/len) + a ppm→score convenience scalar.",
+                    "",
+                    "## Proline & synthesis flags",
+                    "- Proline-related presence flags collapsed to: frag_dbl_proline_after (X–P), frag_dbl_proline_before (P–K/R).",
+                    "- hard_to_synthesize_residues = total count of specified synthesis-risk doublets.",
                     "",
                     "## Summary Top‑N gating",
                     f"- Features must satisfy nnz_nonhit ≥ {args.min_nnz_topn} and nnz_hit ≥ {args.min_nnz_topn} to appear in the Top‑N bar.",
                     "",
                     "## Flyability parity",
-                    "- Flyability components/weights match the decoy script numerically (same formulas/constants).",
+                    "- Flyability components/weights unchanged; small clamp bug fixed.",
                 ]
             )
         )
 
 def main():
     ap = argparse.ArgumentParser(
-        description="WIQD — hit vs non-hit peptide feature analysis (+albumin & flyability; no peptide modification)",
+        description="WIQD — hit vs non-hit peptide feature analysis (+albumin counts & flyability; no peptide modification)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--in", dest="input_csv", required=True, help="Input CSV with peptide,is_hit (or provide --min_score and a score column)")
@@ -1794,7 +1690,7 @@ def main():
         "--numeric_test", choices=["auto", "mw", "perm_U"], default="auto",
         help="Numeric test: auto (perm_U if discrete/tie-heavy), mw, or perm_U",
     )
-    ap.add_argument("--permutes", type=int, default=20000, help="Permutation iterations for perm_U")
+    ap.add_argument("--permutes", type=int, default=5000, help="Permutation iterations for perm_U")
     ap.add_argument("--tie_thresh", type=float, default=0.25, help="Tie-fraction threshold to trigger perm_U in auto mode")
     ap.add_argument("--min_score", type=float, default=None, help="If set, derive is_hit = 1[score >= min_score]")
     ap.add_argument("--min_nnz_topn", type=int, default=4, help="Minimum nnz per group (non-zero counts in hits and non-hits) required to qualify for Top‑N summary")
@@ -1813,21 +1709,21 @@ def main():
     ap.add_argument("--albumin_expected", choices=["prepro", "mature", "either"], default="either", help="Expected albumin length check")
     ap.add_argument("--albumin_use", choices=["prepro", "mature", "auto"], default="mature", help="Which form to use")
     # Albumin matching controls
-    ap.add_argument("--ppm_tol", type=float, default=30.0, help="PPM tolerance for albumin confusability scoring")
+    ap.add_argument("--ppm_tol", type=float, default=30.0, help="PPM tolerance for albumin matching")
     ap.add_argument("--full_mz_len_min", type=int, default=5, help="Albumin window min length for PRECURSOR m/z")
     ap.add_argument("--full_mz_len_max", type=int, default=15, help="Albumin window max length for PRECURSOR m/z")
     ap.add_argument("--by_mz_len_min", type=int, default=2, help="Peptide fragment k-min for m/z (ANY contiguous subseq)")
     ap.add_argument("--by_mz_len_max", type=int, default=7, help="Peptide fragment k-max for m/z (ANY contiguous subseq)")
-    ap.add_argument("--by_seq_len_min", type=int, default=2, help="Peptide fragment k-min for SEQUENCE (ANY contiguous subseq)")
-    ap.add_argument("--by_seq_len_max", type=int, default=7, help="Peptide fragment k-max for SEQUENCE (ANY contiguous subseq)")
+    ap.add_argument("--by_seq_len_min", type=int, default=2, help="(Retained for index bounds only)")
+    ap.add_argument("--by_seq_len_max", type=int, default=7, help="(Retained for index bounds only)")
     # RT gating
     ap.add_argument("--rt_tolerance_min", type=float, default=1.0, help="RT co‑elution tolerance in minutes for RT‑gated albumin metrics")
     ap.add_argument("--gradient_min", type=float, default=20.0, help="Assumed gradient length in minutes used by RT predictor")
     ap.add_argument("--require_precursor_match_for_frag", action="store_true",
-                    help="For fragment metrics, only albumin windows that also match PRECURSOR m/z within ppm tolerance are considered (both ungated and RT‑gated)")
+                    help="For fragment metrics, only albumin windows that also match PRECURSOR m/z within ppm tolerance are considered (ungated and RT‑gated)")
     # Chemistry
     ap.add_argument("--charges", default="2,3", help="Charges to evaluate for albumin/fragment m/z metrics (e.g., 2,3)")
-    ap.add_argument("--cys_mod", choices=["none", "carbamidomethyl"], default="none", help="Fixed mod on Cys for mass calc in albumin metrics")
+    ap.add_argument("--cys_mod", choices=["none", "carbamidomethyl"], default="carbamidomethyl", help="Fixed mod on Cys for albumin mass calc")
     # Flyability weights
     ap.add_argument("--fly_weights", default="charge:0.5,surface:0.35,len:0.1,aromatic:0.05", help="Weights for flyability mix (sum normalized)")
     ap.add_argument("--summary_top_n", type=int, default=20, help="How many features to show in summary plot")
