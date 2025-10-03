@@ -1,15 +1,26 @@
-python decoygen5.py \
+python decoygen.py \
   --in pfo017-candidates.csv \
-  --outdir out-decoys5 \
-  --frag-charges 1,2,3 \
-  --charges 1,2,3 \
-  --xle-collapse 1  \
+  --outdir out-decoys \
   --peptide-col epitope \
   --pos-col MT_pos \
   --mut-notation-col Gene_AA_Change \
   --indexing C1 \
-  --download-sets \
-  --N 10
-
-
-
+  --require-mut-idx0 1 \
+  --download-sets 1 \
+  --sets albumin,keratins,proteases,mhc_hardware \
+  --charges 1,2,3 \
+  --frag-charges 1,2,3 \
+  --xle-collapse \
+  --nterm-good RYLFDM --nterm-bad-strong KP --nterm-bad-weak STVA --nterm-targets RYLFDM \
+  --bad-internal Q \
+  --rule-flank-gap-min 2 \
+  --rank-weights "fly:0.25,hydro:0.25,conf_mz:0.15,term:0.10,polymer:0.20,types:0.05" \
+  --overall-rule-weight 1.0 --overall-cont-weight 1.0 \
+  --polymer-families PEG,PPG,PTMEG,PDMS --polymer-endgroups auto --polymer-adducts H,Na,K,NH4 --polymer-z 1,2,3 \
+  --polymer-ppm-strict 10 \
+  --N 10 \
+  --require-contam-match 1 \
+  --min-confusability-ratio 0.90 \
+  --require-hydro-increase 1 --hydro-delta-min 1e-6 \
+  --dense-threshold 1500 \
+  --verbose

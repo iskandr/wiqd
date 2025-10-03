@@ -1,0 +1,33 @@
+# ===== Motifs (doublets) =====
+FRAG_DOUBLETS = ["AP", "SP", "TP", "GP", "DP", "EP", "KP", "RP", "PP", "PK", "PR"]
+
+SYN_RISK_DOUBLETS = [
+    "DG",
+    "DS",
+    "DT",
+    "DN",
+    "DP",
+    "NG",
+    "NS",
+    "NT",
+    "NN",
+    "QG",
+    "QS",
+    "QT",
+    "QN",
+    "PP",
+    "KK",
+    "RR",
+    "KR",
+    "RK",
+    "CC",
+    "MM",
+    "MW",
+    "WM",
+    "WW",
+    "YY",
+    "FF",
+    "II",
+    "LL",
+    "VV",
+]
