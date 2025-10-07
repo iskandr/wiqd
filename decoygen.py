@@ -733,8 +733,6 @@ class RuleParams:
     nterm_targets: Tuple[str, ...]
     bad_internal: Tuple[str, ...]
 
-    rule_flank_gap_min: int  # kept for compatibility
-
     # Added knobs (wired from CLI):
     hydro_internal_min: int = 4
     hydro_internal_bonus: float = 0.5
@@ -1425,7 +1423,7 @@ def edit_path_plot_colored(
         node_label = st
         if edge_labels and i > 0 and (i - 1) < len(edge_labels):
             node_label = f"\n{edge_labels[i - 1]}"
-        print(node_label)
+
         ax.annotate(
             node_label,
             (xvals[i], yvals[i]),
