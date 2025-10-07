@@ -467,7 +467,21 @@ def doublet_features(peptide: str):
     out["frag_doublet_total_count"] = float(frag_total)
     out["frag_doublet_total_frac"] = float(frag_total) / bonds
     # Proline aggregation (binary presence)
-    proline_after_set = {"AP", "SP", "TP", "GP", "DP", "EP", "KP", "RP", "PP"}
+    proline_after_set = {
+        "AP",
+        "SP",
+        "TP",
+        "GP",
+        "DP",
+        "EP",
+        "KP",
+        "RP",
+        "PP",
+        "VP",
+        "HP",
+        "IP",
+        "LP",
+    }
     proline_before_set = {"PK", "PR", "PP"}  # PP counts for both
     out["frag_dbl_proline_after"] = (
         1 if any(counts.get(di, 0) > 0 for di in proline_after_set) else 0
@@ -944,6 +958,123 @@ def write_assumptions_report(
         )
     with open(os.path.join(outdir, "ASSUMPTIONS.txt"), "w") as fh:
         fh.write("\n".join(lines))
+
+
+# =================== Feature type inference (auto) ===================
+def _norm_to_unit_set(vals, eps: float = 1e-12):
+    """
+    Normalize a small set of unique values to canonical {-1, 0, 1} (and bools),
+    keeping anything else as-is. NaNs are ignored by the caller.
+    """
+    out = set()
+    for v in vals:
+        # skip NaN safely (works for floats and pandas NA scalars)
+        try:
+            if v != v:  # NaN != NaN
+                continue
+        except Exception:
+            pass
+        if isinstance(v, bool):
+            out.add(1 if v else 0)
+            continue
+        if isinstance(v, (int, float)):
+            fv = float(v)
+            if math.isfinite(fv):
+                if abs(fv - 1.0) <= eps:
+                    out.add(1.0)
+                    continue
+                if abs(fv) <= eps:
+                    out.add(0.0)
+                    continue
+                if abs(fv + 1.0) <= eps:
+                    out.add(-1.0)
+                    continue
+        out.add(v)
+    return out
+
+
+def infer_feature_types_auto(
+    df: pd.DataFrame,
+    exclude: Iterable[str] = ("peptide", "is_hit"),
+    eps: float = 1e-12,
+):
+    """
+    Return (numeric_feats, binary_feats, binary_scheme) where:
+      - numeric_feats: numeric, non-binary columns
+      - binary_feats: binary columns
+      - binary_scheme: dict feature -> "01" or "pm1"
+    All-NaN columns are ignored.
+    """
+    binary_feats = []
+    numeric_feats = []
+    binary_scheme = {}  # feature -> "01" (0/1) or "pm1" (-1/1)
+
+    for col in df.columns:
+        if col in exclude:
+            continue
+        s = df[col]
+        # Only consider numeric/bool; skip objects/strings
+        if not (pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s)):
+            continue
+
+        uniq = pd.unique(s.dropna())
+        if len(uniq) == 0:
+            # all missing; ignore this feature
+            continue
+
+        norm = _norm_to_unit_set(uniq, eps=eps)
+        if norm <= {0.0, 1.0}:
+            binary_feats.append(col)
+            binary_scheme[col] = "01"
+        elif norm <= {-1.0, 1.0}:
+            binary_feats.append(col)
+            binary_scheme[col] = "pm1"
+        else:
+            numeric_feats.append(col)
+
+    # Ensure separation
+    keep_numeric = set(numeric_feats) - set(binary_feats)
+    numeric_feats = [c for c in df.columns if c in keep_numeric]
+    return numeric_feats, binary_feats, binary_scheme
+
+
+def normalize_binary_series(s: pd.Series, scheme: str, eps: float = 1e-12) -> pd.Series:
+    """
+    Convert a binary-typed series to {0.0, 1.0} with NaNs preserved.
+    - scheme "01": values near {0,1} (and bools) -> 0/1
+    - scheme "pm1": values near {-1,1} -> 0/1 via -1→0,  1→1
+    """
+    if pd.api.types.is_bool_dtype(s):
+        return s.map(lambda x: 1.0 if bool(x) else 0.0)
+
+    s_num = pd.to_numeric(s, errors="coerce")
+
+    if scheme == "01":
+
+        def map01(x):
+            if isinstance(x, (int, float)) and math.isfinite(float(x)):
+                if abs(x - 1.0) <= eps:
+                    return 1.0
+                if abs(x) <= eps:
+                    return 0.0
+            return float("nan")
+
+        return s_num.map(map01)
+
+    if scheme == "pm1":
+
+        def map_pm1(x):
+            if isinstance(x, (int, float)) and math.isfinite(float(x)):
+                if abs(x - 1.0) <= eps:
+                    return 1.0
+                if abs(x + 1.0) <= eps:
+                    return 0.0
+            return float("nan")
+
+        return s_num.map(map_pm1)
+
+    # Fallback (shouldn't happen with our inference)
+    return s_num
 
 
 # =================== Analysis ===================

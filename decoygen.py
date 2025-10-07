@@ -1,47 +1,75 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Decoy generation with rule + continuous features, multi-source confusability,
-housekeeping k‑mer parity with WIQD, frameshift handling, and rich plotting.
+Decoy generation (RULE‑FIRST permutations; performance‑aware; mutation‑aware) with:
 
-Highlights
-----------
-• Makes ONE decoy per input peptide via an explicit edit path:
-  Nterm → C → P → M → Cterm (skips any step that’s already “good”).
-• Frameshifts (“fs” in mutation notation):
-  – Do not require a mutation index.
-  – If the peptide lacks C, evaluate C placement at ANY position (including terminals)
-    and pick the best candidate under the same ranking/tie rules.
-• Rule score tiers: N-term tiers (good/bad-weak/bad-strong), proline context,
-  hydrophobic C-term, internal penalties/bonuses (bad residues, internal C/M),
-  plus a spacing bonus for C/M around P.
-• Continuous tie-breakers and ranking signals:
-  – Hydrophobicity (KD-derived fly_surface_norm) + KD hydrophobic fraction
-  – Multi-source protein confusability (precursor m/z + RT + fragment chaining)
-  – Housekeeping homology (HK k-mer fraction), matching WIQD logic
-  – Optional PEG-like isobar proximity (families / endgroups / adducts)
-  – AA-type diversity metric
-• Selection is improvement- & diversity-aware with hard constraints (same defaults):
-  – confusability_new ≥ min_ratio × confusability_old
-  – hydrophobicity_new ≥ hydrophobicity_old + delta_min (if required)
-  – optional hydrophobic C-term enforcement and contaminant-match requirement
-  – k-mer de-duplication for the final Top-N
-• Rich plots:
-  – Classic edit-path plots (confusability vs hydrophobicity) in plots/edit_paths/
-  – Per-letter colored stage labels in traces (selected & not selected)
-  – Density-aware scatters, score-decomposition, deltas, distributions, falloff diagnostics
+Core semantics (as requested)
+-----------------------------
+• **Skip logic**: a stage is *skipped* iff its criterion is already met:
+  – N‑term good → don’t edit N‑term.
+  – C‑term hydrophobic → don’t edit C‑term (Ala C‑term remains frozen).
+  – If an internal P/C/M already exists → skip that stage.
+  – If an internal R/K already exists **or an R exists anywhere in the sequence (incl. termini)** → skip RK stage.
+• **First internal edit at mutant site (non‑frameshift)**:
+  – The first internal edit that isn’t skipped must be applied at `mut_idx0`.
+  – Never set the mutant site to the original WT or MUT residue.
+  – Special case: if mut is P→C, C‑stage always skips; P‑stage skips *that position* but may edit elsewhere later.
+• **Proline placement & context**:
+  – P is never placed at ends; allowed 1‑based positions ∈ [4 .. n−2].
+  – Never edit the residue immediately before a Proline.
+• **C/M around P**: prefer (small bonus) having C and M on **opposite sides** of an internal P when possible—
+  both orientations considered (M left / C right **and** M right / C left).
+• **Tie reducer**: +0.5 raw rule bonus if ≥4 internal hydrophobic residues (I/L/V/F/Y/W/M) beyond termini.
+
+Charge heuristics and rules
+---------------------------
+• Deterministic, sequence‑only ESI charge predictor (precursor z ∈ {1..4}).
+• Predicted b/y fragment charge split per cleavage; optionally:
+  – skip b1/b2 and y1/y2,
+  – avoid cleavage C‑terminal to Proline (“after Proline”).
+• **Rule A (1 point)**: add +1.0 to the rule total **iff**:
+  – predicted precursor charge ∈ [2..4], **and**
+  – at least one predicted fragment (excluding b1,b2,y1,y2 and after‑Proline cleavages) has charge ≥ 2.
+• **Rule B (1 point, new)**: add +1.0 **iff**:
+  – predicted precursor charge ∈ {2,3,4}, **and**
+  – there are **≥3 predicted fragments** (excluding b1/b2/y1/y2 and honoring “avoid after‑Proline”) with fragment charge **2 or 3**.
+
+Ranking & selection
+-------------------
+• Final winner per peptide among rule‑best survivors uses continuous features:
+  – Confusability (0–1) vs contaminant windows (m/z+RT+frags),
+  – Hydrophobic **fraction** (0–1).
+  Tie‑break: higher hydrophobic fraction → longer HK substring → fewer D/E → lexicographic.
+• Global composite (dataset ranking) = **normalized** combination of:
+  – hydrophobicity (KD→[0,1]), confusability (0–1), HK k‑mer fraction (0–1), and optional polymer proximity (0–1).
+  No double‑counting (the legacy “fly” is not used in the composite).
+• Dataset Top‑N selection: standard thresholding vs originals (unchanged), with constraints.
+
+Performance
+-----------
+• Beam search:
+  – `--term-beam` (default 3) keeps top‑K terminal variants per stage by rule score.
+  – `--beam-internal` (default 128) prunes internal stage frontiers per permutation by rule score (and a stable key).
+• Charge predictor reduces charge enumeration; fragment pruning avoids tiny ions and post‑Proline cleavages.
+• C/M split preference encoded as a rule bonus; does not force ordering.
+• Fragment m/z generation uses caching + pruning; windows remain pre‑indexed with sorted fragment m/z and bisection.
+
+Outputs
+-------
+• CSVs: all originals (scored), all decoys, selected top‑N.
+• Plots: colored **edit paths (only steps where edits occurred, not “keeps”)** and scatter/histograms.
+• README summarizing rules and units.
 
 Dependencies
 ------------
-numpy, pandas, matplotlib, tqdm, requests (only if --download-sets / --download-housekeeping is used)
-
-Relies on your ecosystem (NO duplication):
-  - wiqd_constants: AA, H2O, PROTON_MASS
-  - wiqd_features: kd_gravy, hydrophobic_fraction, mass_neutral, mz_from_mass, mz_from_sequence
-  - wiqd_rt_proxy: predict_rt_min
-  - wiqd_peptide_similarity: enumerate_polymer_series
-  - wiqd_proteins: load_housekeeping_sequences
-  - wiqd_sequence_helpers: collapse_seq_mode
+numpy, pandas, matplotlib (Agg), tqdm, requests (only if downloads enabled)
+External helpers (unchanged API):
+  - wiqd_peptide_similarity.enumerate_polymer_series
+  - wiqd_constants.AA, H2O, PROTON_MASS as PROTON
+  - wiqd_features.kd_gravy, hydrophobic_fraction, mass_neutral, mz_from_mass, mz_from_sequence
+  - wiqd_rt_proxy.predict_rt_min
+  - wiqd_proteins.load_housekeeping_sequences
+  - wiqd_sequence_helpers.collapse_seq_mode
 """
 
 from __future__ import annotations
@@ -52,6 +80,8 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from itertools import permutations
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -72,9 +102,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# ------------------------ Imports from helpers (no duplication) ---------------
+# ------------------------ External helpers ----------------
 from wiqd_peptide_similarity import enumerate_polymer_series
-from wiqd_constants import AA, H2O, PROTON_MASS as PROTON
+from wiqd_constants import AA, H2O, PROTON_MASS as PROTON, AA_HYDRO_CTERM
 from wiqd_features import (
     kd_gravy,
     hydrophobic_fraction,
@@ -83,15 +113,14 @@ from wiqd_features import (
     mz_from_sequence,
 )
 from wiqd_rt_proxy import predict_rt_min
-
-# Housekeeping parity with WIQD
 from wiqd_proteins import load_housekeeping_sequences
 from wiqd_sequence_helpers import collapse_seq_mode
 
+# =============================================================================
+# Utilities
+# =============================================================================
 
-# =============================================================================
-# Small utilities
-# =============================================================================
+
 def ensure_outdir(p: str | os.PathLike):
     os.makedirs(p, exist_ok=True)
 
@@ -100,10 +129,6 @@ def parse_csv_list(s: Optional[str], cast=str) -> Tuple:
     if not s:
         return tuple()
     return tuple(cast(x.strip()) for x in s.split(",") if x.strip())
-
-
-def collapse_xle(s: str, on: bool) -> str:
-    return s.replace("I", "J").replace("L", "J") if on else s
 
 
 def clean_seq(s: str) -> str:
@@ -117,8 +142,6 @@ def kmer_set(s: str, k: int) -> Set[str]:
 
 
 class RobustMinMax:
-    """Fit on a reference series; apply to others with clipping (robust bounds)."""
-
     def __init__(self, ref: pd.Series, lo_pct: float = 1.0, hi_pct: float = 99.0):
         arr = ref.to_numpy(float)
         self.lo = float(np.nanpercentile(arr, lo_pct)) if len(arr) else 0.0
@@ -141,8 +164,9 @@ class RobustMinMax:
 
 
 # =============================================================================
-# Contaminant sets: accessions to download (or local FASTA files)
+# Contaminant sets (download or FASTA)
 # =============================================================================
+
 DOWNLOAD_RECIPES = {
     "albumin": {"type": "uniprot_accessions", "accessions": ["P02768"]},
     "keratins": {
@@ -166,12 +190,6 @@ DOWNLOAD_RECIPES = {
         "accessions": ["P61769", "P01892", "P01899", "P01889", "P13747"],
     },
 }
-SET_FRIENDLY = {
-    "albumin": "Albumin",
-    "keratins": "Keratins",
-    "proteases": "Proteases (autolysis)",
-    "mhc_hardware": "MHC hardware (B2M/HLA)",
-}
 
 
 def _parse_fasta_to_acc_seq(text: str) -> Dict[str, str]:
@@ -191,7 +209,6 @@ def _parse_fasta_to_acc_seq(text: str) -> Dict[str, str]:
             chunks.append(re.sub(r"[^A-Z]", "", line.strip().upper()))
     if acc is not None and chunks:
         acc_to_seq[acc] = "".join(chunks)
-    # keep only AAs
     for k in list(acc_to_seq.keys()):
         acc_to_seq[k] = "".join(ch for ch in acc_to_seq[k] if ch in AA)
     return acc_to_seq
@@ -218,24 +235,19 @@ def load_sets(
     do_download: bool,
     timeout: int,
 ) -> Dict[str, Dict[str, str]]:
-    """
-    Return dict: set_name -> {accession: sequence}. Requires local FASTA or --download-sets 1.
-    """
     out: Dict[str, Dict[str, str]] = {}
     for s in set_names:
-        if s not in DOWNLOAD_RECIPES:
-            raise ValueError(f"Unknown set '{s}'. Available: {list(DOWNLOAD_RECIPES)}")
         acc2seq: Dict[str, str] = {}
-        # 1) Local FASTA
         if sets_fasta_dir:
             f = os.path.join(sets_fasta_dir, f"{s}.fasta")
             if os.path.isfile(f):
                 LOG.info(f"[sets] Reading FASTA: {f}")
                 with open(f, "r") as fh:
                     acc2seq = _parse_fasta_to_acc_seq(fh.read())
-        # 2) Download (if allowed)
         if not acc2seq and do_download:
-            recipe = DOWNLOAD_RECIPES[s]
+            recipe = DOWNLOAD_RECIPES.get(s)
+            if not recipe:
+                raise ValueError(f"Unknown set '{s}'. Known: {list(DOWNLOAD_RECIPES)}")
             if recipe.get("type") == "uniprot_accessions":
                 acc2seq = download_uniprot_accessions(
                     recipe.get("accessions", []), timeout=timeout
@@ -250,8 +262,10 @@ def load_sets(
 
 
 # =============================================================================
-# Windows & confusability (internal implementation, tuned for speed)
+# Windows & confusability
 # =============================================================================
+
+
 @dataclass
 class Window:
     seq: str
@@ -315,7 +329,79 @@ def index_fragments_for_windows(
         w.frag_mz_sorted = arr
 
 
-def confusability_script1(
+# ---------- Charge heuristic (precursor + fragment charge splits) -------------
+
+
+@lru_cache(maxsize=100000)
+def _basicity_proxy(s: str) -> float:
+    w = {"R": 1.0, "K": 0.8, "H": 0.3}
+    return 0.35 + sum(w.get(a, 0.0) for a in s)
+
+
+@lru_cache(maxsize=100000)
+def predict_precursor_charge(seq: str, max_z: int = 4) -> int:
+    """Sequence‑only positive‑mode precursor charge prediction (1..max_z)."""
+    s = _basicity_proxy(seq)
+    L = len(seq)
+    s += 0.2 * (L >= 12) + 0.3 * (L >= 16)
+    s -= 0.2 * ((seq.count("D") + seq.count("E")) >= 3)
+    if seq.endswith(("K", "R")):
+        s += 0.2
+    z = 1
+    for t in (1.2, 2.2, 3.2):
+        if s >= t:
+            z += 1
+    return min(z, max_z)
+
+
+@lru_cache(maxsize=100000)
+def _frag_capacity(subseq: str, ion: str) -> float:
+    """Relative ability of a fragment to hold charge."""
+    w = {"R": 1.0, "K": 0.8, "H": 0.3}
+    cap = sum(w.get(a, 0.0) for a in subseq)
+    if ion == "b":
+        cap += 0.5  # new N-terminus
+    else:
+        cap += 0.35  # new C-terminus
+        if subseq.endswith(("K", "R")):
+            cap += 0.4  # tryptic y-ion bias
+    return max(cap, 0.0)
+
+
+@lru_cache(maxsize=200000)
+def predict_b_y_charges(
+    seq: str, precursor_z: int
+) -> Tuple[Tuple[int, int, int, int], ...]:
+    """
+    For each cleavage (i|i+1), return tuples: (i, zb, zy, L)
+    where i is the cleavage index (1..L-1), zb = charge on b, zy on y.
+    A simple rule: if z==1, assign all to higher-capacity side; if z>=2, enforce at least 1+ per side,
+    remaining goes to higher-capacity side.
+    """
+    L = len(seq)
+    out: List[Tuple[int, int, int, int]] = []
+    for i in range(1, L):
+        b, y = seq[:i], seq[i:]
+        cb, cy = _frag_capacity(b, "b"), _frag_capacity(y, "y")
+        z = int(precursor_z)
+        if z == 1:
+            zb, zy = (1, 0) if cb >= cy else (0, 1)
+        else:
+            zb = zy = 1
+            rem = z - 2
+            if rem > 0:
+                if cb >= cy:
+                    zb += rem
+                else:
+                    zy += rem
+        out.append((i, zb, zy, L))
+    return tuple(out)
+
+
+# -------------------- Confusability (with heuristics & pruning) ---------------
+
+
+def confusability_in_mz(
     pep: str,
     windows: List[Window],
     full_len_min: int,
@@ -329,11 +415,47 @@ def confusability_script1(
     kmax: int,
     good_ppm: float,
     frag_types_req: int,
+    *,
+    # ---- all options are explicit arguments (no function attributes) ----
+    use_charge_pred: bool,
+    max_pred_z: int,
+    skip_short_frags: bool,
+    avoid_post_proline: bool,
+    require_frag_z2: bool,
     frag_charges: Optional[Iterable[int]] = None,
 ) -> Dict[str, object]:
-    """Score in [0,1] based on precursor m/z proximity, RT coelution, and chained b/y fragment matches."""
+    """
+    Score confusability of 'pep' vs pre-indexed contaminant windows.
+
+    Parameters
+    ----------
+    use_charge_pred : bool
+        If True, use predicted precursor charge (single z) and predicted b/y splits.
+        If False, enumerate `precursor_charges` for precursor m/z and `frag_charges` for fragments.
+    max_pred_z : int
+        Upper bound for predicted precursor charge (typically 4).
+    skip_short_frags : bool
+        If True, skip b1/b2 and y1/y2.
+    avoid_post_proline : bool
+        If True, avoid cleavages C-terminal to Proline for fragment matching.
+    require_frag_z2 : bool
+        If True, require that at least one predicted fragment has charge ≥2; otherwise zero out fragment match terms.
+    """
+    # Precursor m/z candidates
+    z_pred = (
+        predict_precursor_charge(pep, max_z=int(max_pred_z))
+        if use_charge_pred
+        else None
+    )
+    prec_zs = (
+        [z_pred]
+        if (use_charge_pred and z_pred is not None)
+        else sorted({int(z) for z in precursor_charges})
+    )
+
+    assert pep.isupper(), pep
+    assert all(ch in AA for ch in pep), pep
     pep_m = mass_neutral(pep, cys_fixed_mod)
-    prec_zs = sorted({int(z) for z in precursor_charges})
     pep_mz_by_z = {z: mz_from_mass(pep_m, z) for z in prec_zs}
     pool = [
         i for i, w in enumerate(windows) if (full_len_min <= w.length <= full_len_max)
@@ -357,6 +479,7 @@ def confusability_script1(
     idx_prec_sub = _precursor_matched_idxs([windows[i] for i in pool])
     prec_idxs = [pool[i] for i in idx_prec_sub]
 
+    # RT co-elution
     def _filter_rt_idxs(idxs: List[int]) -> List[int]:
         lo, hi = rt_pred_min - rt_tol_min, rt_pred_min + rt_tol_min
         return [
@@ -381,22 +504,50 @@ def confusability_script1(
     best_all = _best_ppm(pool) if pool else float("inf")
     best_rt = _best_ppm(idx_prec_rt) if idx_prec_rt else float("inf")
 
-    frag_zs = list(frag_charges) if frag_charges is not None else prec_zs
-
+    # Build peptide fragment m/z list
     def _pep_by_frag_mzs() -> List[Tuple[float, str, int, int]]:
         L = len(pep)
+        skip_short, avoid_post_pro = bool(skip_short_frags), bool(avoid_post_proline)
         out = []
         if L <= 1:
             return out
-        kmax_eff = min(kmax, L - 1)
-        kmin_eff = max(1, min(kmin, kmax_eff))
-        for k in range(kmin_eff, kmax_eff + 1):
-            bseq, yseq = pep[:k], pep[-k:]
-            for z in frag_zs:
-                bmz = (mass_neutral(bseq, cys_fixed_mod) - H2O + z * PROTON) / z
-                ymz = (mass_neutral(yseq, cys_fixed_mod) + z * PROTON) / z
-                out.append((bmz, "b", k, z))
-                out.append((ymz, "y", k, z))
+
+        if use_charge_pred and z_pred is not None:
+            # use predicted split charges per cleavage
+            splits = predict_b_y_charges(pep, z_pred)
+            for i, zb, zy, _L in splits:
+                if skip_short and (i <= 2 or (L - i) <= 2):  # skip b1/b2 and y1/y2
+                    continue
+                if avoid_post_pro and pep[i - 1] == "P":  # cleavage after P
+                    continue
+                bseq, yseq = pep[:i], pep[i:]
+                if zb >= 1:
+                    bmz = (mass_neutral(bseq, cys_fixed_mod) - H2O + zb * PROTON) / zb
+                    out.append((bmz, "b", i, zb))
+                if zy >= 1:
+                    ymz = (mass_neutral(yseq, cys_fixed_mod) + zy * PROTON) / zy
+                    out.append((ymz, "y", L - i, zy))
+        else:
+            # classic enumeration over (ion,k,z) with CORRECT "after-Proline" checks for b_k and y_k
+            frag_zs = list(frag_charges) if frag_charges is not None else prec_zs
+            kmin_eff = max(1, min(kmin, min(kmax, L - 1)))
+            kmax_eff = min(kmax, L - 1)
+            for k in range(kmin_eff, kmax_eff + 1):
+                i_b = k  # cleavage index for b_k
+                i_y = L - k  # cleavage index for y_k
+                if skip_short and (k <= 2 or (L - k) <= 2):  # b1/b2 or y1/y2
+                    continue
+                skip_b = avoid_post_pro and i_b > 0 and pep[i_b - 1] == "P"
+                skip_y = avoid_post_pro and i_y > 0 and pep[i_y - 1] == "P"
+
+                bseq, yseq = pep[:k], pep[-k:]
+                for z in frag_zs:
+                    if not skip_b:
+                        bmz = (mass_neutral(bseq, cys_fixed_mod) - H2O + z * PROTON) / z
+                        out.append((bmz, "b", k, z))
+                    if not skip_y:
+                        ymz = (mass_neutral(yseq, cys_fixed_mod) + z * PROTON) / z
+                        out.append((ymz, "y", k, z))
         return out
 
     fr = _pep_by_frag_mzs()
@@ -426,12 +577,23 @@ def confusability_script1(
     ft_all = _count_types(prec_idxs)
     ft_rt = _count_types(idx_prec_rt)
     frac_all, frac_rt = ft_all / n_types, ft_rt / n_types
+
+    if require_frag_z2:
+        has_z2 = any(z >= 2 for (_, _, _, z) in fr)
+        if not has_z2:
+            ft_all = 0
+            ft_rt = 0
+            frac_all = 0.0
+            frac_rt = 0.0
+
+    # Final confusability score
     if best_all <= good_ppm and ft_rt >= frag_types_req:
         score = 1.0
     else:
         ppm_term = max(0.0, 1.0 - min(best_all, ppm_tol) / ppm_tol)
-        frag_term = min(1.0, (0.7 * frac_rt + 0.3 * frac_all))
+        frag_term = min(1.0, 0.7 * frac_rt + 0.3 * frac_all)
         score = max(0.0, min(1.0, 0.5 * ppm_term + 0.5 * frag_term))
+
     return {
         "score": score,
         "best_ppm": best_all,
@@ -440,15 +602,14 @@ def confusability_script1(
         "n_prec_rt": float(len(idx_prec_rt)),
         "frac_frag_rt": frac_rt,
         "frac_frag_all": frac_all,
-        "prec_idxs": prec_idxs,
-        "prec_idxs_rt": idx_prec_rt,
-        "frag_types_rt": ft_rt,
     }
 
 
 # =============================================================================
-# PEG-like candidates (dict-based; fixes earlier tuple mismatch)
+# PEG
 # =============================================================================
+
+
 def polymer_best_for_peptide(
     seq: str,
     candidates: List[Dict[str, object]],
@@ -456,10 +617,6 @@ def polymer_best_for_peptide(
     ppm_window: float = 10.0,
     cys_fixed_mod: float = 0.0,
 ) -> Dict[str, object]:
-    """
-    Choose the best PEG-like match among candidates (dicts from enumerate_polymer_series).
-    Returns a dict with polymer_match_flag, polymer_best_abs_ppm, polymer_conf, polymer_details.
-    """
     if not candidates:
         return {
             "polymer_match_flag": 0,
@@ -467,14 +624,11 @@ def polymer_best_for_peptide(
             "polymer_details": "",
             "polymer_conf": 0.0,
         }
-
-    best = (float("inf"), None, None, None)  # absppm, cand, z, pep_mz
-    # index by z for speed
+    best = (float("inf"), None, None, None)
     byz: Dict[int, List[Dict[str, object]]] = {}
     for c in candidates:
         z = int(c["z"])
         byz.setdefault(z, []).append(c)
-
     for z in sorted({int(z) for z in peptide_z}):
         arr = byz.get(z, [])
         if not arr:
@@ -485,7 +639,6 @@ def polymer_best_for_peptide(
         d_ppm = (mzs[j] - pep_mz) / pep_mz * 1e6
         if abs(d_ppm) < best[0]:
             best = (abs(d_ppm), arr[j], z, pep_mz)
-
     absppm, cand, pepz, pep_mz = best
     if cand is None:
         return {
@@ -497,8 +650,8 @@ def polymer_best_for_peptide(
     polymer_conf = max(0.0, 1.0 - min(absppm, ppm_window) / ppm_window)
     detail = (
         f"{cand['family']};end={cand['endgroup']};n={cand['n']};"
-        f"adducts={cand['adducts']};polymer_z={cand['z']};"
-        f"pep_z={pepz};polymer_mz={float(cand['mz']):.6f};pep_mz={pep_mz:.6f}"
+        f"adducts={cand['adducts']};polymer_z={cand['z']};pep_z={pepz};"
+        f"polymer_mz={float(cand['mz']):.6f};pep_mz={pep_mz:.6f}"
     )
     return {
         "polymer_match_flag": 1 if absppm <= ppm_window else 0,
@@ -509,8 +662,10 @@ def polymer_best_for_peptide(
 
 
 # =============================================================================
-# Housekeeping homology (parity with WIQD)
+# Housekeeping homology (HK) + longest substring index
 # =============================================================================
+
+
 def build_hk_kmer_bank(
     seqs: Dict[str, str], k: int = 4, collapse: str = "xle"
 ) -> Set[str]:
@@ -533,112 +688,254 @@ def hk_kmer_features(
     return {"hk_kmer_hits": float(hits), "hk_kmer_frac": float(hits) / max(1, len(kms))}
 
 
+def build_hk_substring_banks(
+    seqs: Dict[str, str], collapse: str = "xle", Lmax: int = 20
+) -> Dict[int, Set[str]]:
+    banks: Dict[int, Set[str]] = {L: set() for L in range(1, Lmax + 1)}
+    for _, seq in seqs.items():
+        s = collapse_seq_mode(seq, collapse)
+        n = len(s)
+        for L in range(1, min(Lmax, n) + 1):
+            for i in range(0, n - L + 1):
+                banks[L].add(s[i : i + L])
+    return banks
+
+
+def hk_longest_substring_len(
+    peptide: str, banks: Dict[int, Set[str]], collapse: str = "xle"
+) -> int:
+    if not banks:
+        return 0
+    s = collapse_seq_mode(peptide, collapse)
+    Lmax = min(max(banks.keys()), len(s))
+    for L in range(Lmax, 0, -1):
+        if L not in banks:
+            continue
+        for i in range(0, len(s) - L + 1):
+            if s[i : i + L] in banks[L]:
+                return L
+    return 0
+
+
 # =============================================================================
-# Rule features & editing (Nterm → C → P → M → Cterm)
+# Rule features (RAW, no normalization) & editing
 # =============================================================================
+
+PROTECTED_SET = {"C", "M", "P"}  # existing residues never overwritten
+PROLINE_PRECEDER_WEAKGOOD = {"I", "L", "V", "F", "Y", "W", "M"}
+
+
 @dataclass
 class RuleParams:
     nterm_good: Tuple[str, ...]
-    nterm_bad_strong: Tuple[str, ...]  # {K, P} as -2
-    nterm_bad_weak: Tuple[str, ...]  # {S, T, V, A} as -1
+    nterm_bad_strong: Tuple[str, ...]
+    nterm_bad_weak: Tuple[str, ...]
     nterm_targets: Tuple[str, ...]
-    bad_internal: Tuple[str, ...]  # e.g., {"Q"}
-    hydrophobic_cterm_set: Tuple[str, ...]
-    rule_flank_gap_min: int
-    xle_collapse: bool
+    bad_internal: Tuple[str, ...]
+
+    rule_flank_gap_min: int  # kept for compatibility
+
+    # Added knobs (wired from CLI):
+    hydro_internal_min: int = 4
+    hydro_internal_bonus: float = 0.5
+    cm_split_bonus: float = 0.25
+    min_precursor_z: int = 2
+    max_precursor_z: int = 4
+    skip_short_frags_rule: bool = True
+    avoid_post_pro_rule: bool = True
 
 
-PROLINE_PRECEDER_TOP = {"A", "G"}
-PROLINE_PRECEDER_GOOD = {"I", "L", "V", "F", "Y", "W", "M"}
-
-
-def nterm_rule(a0: str, p: RuleParams) -> int:
-    if a0 in p.nterm_good:
-        return 1
-    if a0 in p.nterm_bad_strong:
-        return -2
-    if a0 in p.nterm_bad_weak:
-        return -1
-    return 0
-
-
-def proline_rule(seq: str) -> int:
+def _proline_context_raw(seq: str, edge_near: int = 1) -> Tuple[float, str]:
+    """
+    Best P context (raw, no scaling), for any internal P:
+        +2.0 : GP internal, not near edges
+        +1.0 : GP near edge OR any AP
+        +0.5 : weak-good (I/L/V/F/Y/W/M before P)
+         0.0 : neutral (!K/R before P)
+        -1.0 : KR before P
+    """
     n = len(seq)
-    idxs = [i for i, a in enumerate(seq) if a == "P" and i not in (0, n - 1)]
-    if not idxs:
-        return 0
-    score = 1  # baseline for internal P
-    good_pre = 0
-    weak_pre = 0
-    only_bad = True
-    for i in idxs:
-        prev = seq[i - 1]
-        if prev in PROLINE_PRECEDER_TOP:
-            good_pre += 1
-            only_bad = False
-        elif prev in PROLINE_PRECEDER_GOOD:
-            weak_pre += 1
-            only_bad = False
-        elif prev not in ("K", "R"):
-            only_bad = False
-    if good_pre > 0:
-        score += 3
-    elif weak_pre > 0:
-        score += 2
-    if only_bad:
-        score -= 1
-    return score
-
-
-def cterm_rule(seq: str, p: RuleParams) -> int:
-    return 1 if seq and seq[-1] in p.hydrophobic_cterm_set else 0
-
-
-def internal_residue_penalties(seq: str, p: RuleParams) -> int:
-    return -1 if any((aa in p.bad_internal) for aa in seq[1:-1]) else 0
-
-
-def bonus_internal_C_M(seq: str) -> int:
-    s = 0
-    if "C" in seq[1:-1]:
-        s += 1
-    if "M" in seq[1:-1]:
-        s += 1
-    return s
-
-
-def bonus_spacing_CM_around_P(seq: str, min_gap: int) -> int:
-    n = len(seq)
-    idxP = [i for i, a in enumerate(seq) if a == "P" and i not in (0, n - 1)]
-    if not idxP or "C" not in seq or "M" not in seq:
-        return 0
-    for i in idxP:
-        idxC = [j for j, a in enumerate(seq) if a == "C"]
-        idxM = [j for j, a in enumerate(seq) if a == "M"]
-        if not idxC or not idxM:
+    best_val, best_cls = 0.0, "none"
+    for i, a in enumerate(seq):
+        if a != "P" or i in (0, n - 1):
             continue
-        dC = min(abs(j - i) for j in idxC)
-        dM = min(abs(j - i) for j in idxM)
-        if dC >= min_gap and dM >= min_gap and dC != 1 and dM != 1:
-            return 1
-    return 0
+        prev = seq[i - 1]
+        near_edge = (i <= edge_near) or (i >= n - 1 - edge_near)
+        if prev == "G":
+            val = 2.0 if not near_edge else 1.0
+            cls = "GP_well" if not near_edge else "GP_edge"
+        elif prev == "A":
+            val, cls = 1.0, "AP"
+        elif prev in PROLINE_PRECEDER_WEAKGOOD:
+            val, cls = 0.5, "weak_good"
+        elif prev in ("K", "R"):
+            val, cls = -1.0, "KR_before_P"
+        else:
+            val, cls = 0.0, "neutral"
+        if (val > best_val) or (val == best_val and best_cls == "none"):
+            best_val, best_cls = val, cls
+    return best_val, best_cls
 
 
-def rule_score(seq: str, p: RuleParams) -> Dict[str, int]:
-    s_nterm = nterm_rule(seq[0], p)
-    s_pro = proline_rule(seq)
-    s_cterm = cterm_rule(seq, p)
-    s_bad = internal_residue_penalties(seq, p)
-    s_spacing = bonus_spacing_CM_around_P(seq, p.rule_flank_gap_min)
-    total = s_nterm + s_pro + s_cterm + s_bad + bonus_internal_C_M(seq) + s_spacing
+def _cm_opposite_sides_bonus(seq: str, bonus: float) -> float:
+    """Small preference if there is a P and C/M lie on opposite sides (either orientation)."""
+    n = len(seq)
+    c_pos = [i for i in range(1, n - 1) if seq[i] == "C"]
+    m_pos = [i for i in range(1, n - 1) if seq[i] == "M"]
+    p_pos = [i for i in range(1, n - 1) if seq[i] == "P"]
+    if not c_pos or not m_pos or not p_pos:
+        return 0.0
+    for p in p_pos:
+        has_left_c = any(i < p for i in c_pos)
+        has_right_c = any(i > p for i in c_pos)
+        has_left_m = any(i < p for i in m_pos)
+        has_right_m = any(i > p for i in m_pos)
+        if (has_left_c and has_right_m) or (has_left_m and has_right_c):
+            return float(bonus)
+    return 0.0
+
+
+def _charge_rule_ok(seq: str, rp: RuleParams) -> bool:
+    """1‑point rule if predicted precursor z in [2..4] AND any predicted fragment has z>=2,
+    excluding b1/b2,y1/y2 and after‑Proline cleavages."""
+    zpred = predict_precursor_charge(seq, max_z=rp.max_precursor_z)
+    if not (rp.min_precursor_z <= zpred <= rp.max_precursor_z):
+        return False
+    splits = predict_b_y_charges(seq, zpred)
+    L = len(seq)
+    for i, zb, zy, _L in splits:
+        if rp.skip_short_frags_rule and (i <= 2 or (L - i) <= 2):
+            continue
+        if rp.avoid_post_pro_rule and seq[i - 1] == "P":
+            continue
+        if zb >= 2 or zy >= 2:
+            return True
+    return False
+
+
+def _charge_rule_strict_ok(seq: str, rp: RuleParams) -> bool:
+    """
+    New coverage rule:
+      +1 if predicted precursor z ∈ {2,3,4} AND there are ≥3 predicted fragments
+      (excluding b1/b2,y1/y2 and honoring 'avoid after‑Proline') whose fragment charge is 2 or 3.
+    """
+    zpred = predict_precursor_charge(seq, max_z=rp.max_precursor_z)
+    if zpred not in (2, 3, 4):
+        return False
+    splits = predict_b_y_charges(seq, zpred)
+    L = len(seq)
+    need = 3
+    got = 0
+    for i, zb, zy, _L in splits:
+        if rp.skip_short_frags_rule and (i <= 2 or (L - i) <= 2):
+            continue
+        if rp.avoid_post_pro_rule and seq[i - 1] == "P":
+            continue
+        # Count both b and y if they meet the charge in {2,3}
+        if zb in (2, 3):
+            got += 1
+            if got >= need:
+                return True
+        if zy in (2, 3):
+            got += 1
+            if got >= need:
+                return True
+    return False
+
+
+def rule_score(seq: str, p: RuleParams) -> Dict[str, float]:
+    """
+    RAW RULE TOTAL (no normalization; spacing bonus removed):
+      +1  if N-term in nterm_good; -2 if strong-bad; -1 if weak-bad
+      +2  for best P context GP (well), +1 GP near edge or AP, +0.5 weak-good, 0 neutral, -1 KR-before-P
+      +1  if C-term hydrophobic
+      -1  if any internal 'bad' residue present (e.g., Q)
+      +1  if internal C present
+      +1  if internal M present
+      +1/0/-1 for basic-site rule (internal R/K vs only H vs none)
+      +0.5 if ≥4 internal hydrophobics (tie reducer; configurable)
+      +0.25 preference if C and M are on opposite sides of a P (either orientation; configurable)
+      +1.0 charge rule if (pred precursor z in [2..4]) and (any fragment has charge ≥2 with pruning)
+      +1.0 **new** charge-coverage rule if (pred precursor z ∈ {2,3,4}) and (≥3 fragments have charge 2 or 3 with pruning)
+    """
+    # (1) N-term
+    nterm_aa = seq[0]
+    if nterm_aa in p.nterm_good:
+        nterm_raw = 1.0
+    elif nterm_aa in p.nterm_bad_strong:
+        nterm_raw = -2.0
+    elif nterm_aa in p.nterm_bad_weak:
+        nterm_raw = -1.0
+    else:
+        nterm_raw = 0.0
+
+    # (2) Proline context
+    pro_raw, pro_cls = _proline_context_raw(seq, edge_near=1)
+
+    # (3) C-term hydrophobicity
+    cterm = 1.0 if (seq[-1] in AA_HYDRO_CTERM) else 0.0
+
+    # (4) Internal "bad" penalty
+    bad_penalty = -1.0 if any((aa in p.bad_internal) for aa in seq[1:-1]) else 0.0
+
+    # (5) Internal C/M bonuses
+    c_internal = 1.0 if "C" in seq[1:-1] else 0.0
+    m_internal = 1.0 if "M" in seq[1:-1] else 0.0
+
+    # (6) Basic-site rule
+    internal_aa = seq[1:-1]
+    has_rk = any(a in ("R", "K") for a in internal_aa)
+    has_h = "H" in internal_aa
+    if has_rk:
+        basic_raw, basic_cls = 1.0, "RK"
+    elif has_h:
+        basic_raw, basic_cls = 0.0, "H_only"
+    else:
+        basic_raw, basic_cls = -1.0, "none"
+
+    # (7) Internal hydrophobic tie‑bonus
+    n_hydro_int = sum(a in ("I", "L", "V", "F", "Y", "W", "M") for a in internal_aa)
+    hydro_int_bonus = (
+        float(p.hydro_internal_bonus)
+        if n_hydro_int >= int(p.hydro_internal_min)
+        else 0.0
+    )
+
+    # (8) C/M opposite‑sides preference
+    cm_bonus = _cm_opposite_sides_bonus(seq, float(p.cm_split_bonus))
+
+    # (9) Charge rule (+1)
+    charge_bonus = 1.0 if _charge_rule_ok(seq, p) else 0.0
+    # (10) New: ≥3 fragments have charge 2 or 3 (+1)
+    charge_frag3_bonus = 1.0 if _charge_rule_strict_ok(seq, p) else 0.0
+
+    total = (
+        nterm_raw
+        + pro_raw
+        + cterm
+        + bad_penalty
+        + c_internal
+        + m_internal
+        + basic_raw
+        + hydro_int_bonus
+        + cm_bonus
+        + charge_bonus
+        + charge_frag3_bonus
+    )
     return {
-        "rule_nterm": s_nterm,
-        "rule_proline": s_pro,
-        "rule_cterm": s_cterm,
-        "rule_bad_internal": s_bad,
-        "rule_internal_c": 1 if "C" in seq[1:-1] else 0,
-        "rule_internal_m": 1 if "M" in seq[1:-1] else 0,
-        "rule_spacing_cm_p": s_spacing,
+        "rule_nterm_raw": nterm_raw,
+        "rule_proline_raw": pro_raw,
+        "rule_proline_class": pro_cls,
+        "rule_cterm_raw": cterm,
+        "rule_bad_internal_raw": bad_penalty,
+        "rule_internal_c_raw": c_internal,
+        "rule_internal_m_raw": m_internal,
+        "rule_basic_sites_raw": basic_raw,
+        "rule_basic_class": basic_cls,
+        "rule_hydro_internal_bonus_raw": hydro_int_bonus,
+        "rule_cm_split_bonus_raw": cm_bonus,
+        "rule_charge_bonus_raw": charge_bonus,
+        "rule_charge_frag3_bonus_raw": charge_frag3_bonus,
         "rule_total": total,
     }
 
@@ -646,242 +943,324 @@ def rule_score(seq: str, p: RuleParams) -> Dict[str, int]:
 @dataclass
 class EditParams:
     nterm_targets: Tuple[str, ...]
-    hydrophobic_cterm_set: Tuple[str, ...]
-    rule_flank_gap_min: int
-    xle_collapse: bool
 
 
-def choose_best_by_rule_then_tie(
-    seq_candidates: List[str],
-    rp: RuleParams,
-    tie_scorer=None,
-) -> str:
-    if not seq_candidates:
-        raise ValueError("empty candidate list")
-    best = []
-    best_rule = -1e9
-    for s in seq_candidates:
-        sc = rule_score(s, rp)["rule_total"]
-        if sc > best_rule:
-            best_rule = sc
-            best = [s]
-        elif sc == best_rule:
-            best.append(s)
-    if len(best) == 1 or tie_scorer is None:
-        return best[0]
-    tb = [(tie_scorer(s), s) for s in best]
-    tb.sort(key=lambda x: x[0], reverse=True)
-    return tb[0][1]
+# =============================================================================
+# Stage expansion helpers (enumeration; stages may skip iff criterion met)
+# =============================================================================
 
 
-def edit_nterm(
-    seq: str, rp: RuleParams, ep: EditParams, tie_scorer=None
-) -> Tuple[str, Optional[str]]:
-    if seq[0] in rp.nterm_good:
-        return seq, None
-    cands = [seq] + [t + seq[1:] for t in ep.nterm_targets if t != seq[0]]
-    best = choose_best_by_rule_then_tie(cands, rp, tie_scorer)
-    return (best, f"Nterm:{seq[0]}→{best[0]}") if best != seq else (seq, None)
+def _compact_token(stage: str, label: str) -> Optional[str]:
+    """Build a compact token from a human-readable label like 'C@5' or 'Nterm:A→R'."""
+    if not label or label.endswith(":keep"):
+        return None
+    if stage in ("Nterm", "Cterm"):
+        try:
+            src, dst = label.split(":")[1].split("→")
+            return ("N" if stage == "Nterm" else "T") + f"{src}>{dst}"
+        except Exception:
+            return ("N" if stage == "Nterm" else "T") + label.replace(":", "")
+    m = re.match(r"([A-Z])@(\d+)", label)
+    if m:
+        aa, pos = m.group(1), m.group(2)
+        return (aa if stage == "RK" and aa in ("R", "K") else stage[0]) + pos
+    return stage[0] + "?"
 
 
-def edit_mutant_to_c(
-    seq: str, mut_idx: Optional[int]
-) -> Tuple[str, Optional[str], bool]:
-    if mut_idx is None or mut_idx < 0 or mut_idx >= len(seq):
-        return seq, None, False
-    if seq[mut_idx] == "C":
-        return seq, None, True
-    new = seq[:mut_idx] + "C" + seq[mut_idx + 1 :]
-    return new, f"C@{mut_idx+1}", True
+@dataclass
+class PathState:
+    seq: str
+    stage_names: List[str]  # nodes: ["orig","Nterm","Cterm",...]
+    stage_seqs: List[str]  # same length as stage_names
+    labels: List[str]  # edge labels between nodes (len = len(stage_names)-1)
+    tokens: List[str]  # only applied-op tokens (no 'keep')
+    # mutation context
+    mut_idx0: Optional[int] = None
+    is_frameshift: bool = False
+    wt_aa: Optional[str] = None
+    mut_aa: Optional[str] = None
+    did_internal_edit: bool = False  # first-internal-edit tracking
+
+    def extend(
+        self, stage: str, new_seq: str, label: str, edited: bool = False
+    ) -> "PathState":
+        new_names = self.stage_names + [stage]
+        new_seqs = self.stage_seqs + [new_seq]
+        new_labels = self.labels + [label or f"{stage}:keep"]
+        tok = _compact_token(stage, label)
+        new_tokens = self.tokens + ([tok] if tok else [])
+        return PathState(
+            new_seq,
+            new_names,
+            new_seqs,
+            new_labels,
+            new_tokens,
+            self.mut_idx0,
+            self.is_frameshift,
+            self.wt_aa,
+            self.mut_aa,
+            self.did_internal_edit or (edited and stage in ("P", "C", "M", "RK")),
+        )
 
 
-def avoid_positions_near_P(seq: str, min_gap: int) -> set:
-    idxP = [i for i, a in enumerate(seq) if a == "P"]
-    avoid = set()
-    for i in idxP:
-        for d in range(-min_gap, min_gap + 1):
-            avoid.add(i + d)
-    return avoid
-
-
-def best_single_sub_for_residue(
+def enumerate_terminals_by_rule(
     seq: str,
-    residue: str,
-    rp: RuleParams,
-    avoid_idx: Optional[set] = None,
-    tie_scorer=None,
-) -> Tuple[str, Optional[str]]:
-    avoid = avoid_idx or set()
-    cands = []
-    for i in range(0, len(seq)):
-        if i in avoid:
-            continue
-        if seq[i] == residue:
-            continue
-        cand = seq[:i] + residue + seq[i + 1 :]
-        cands.append((cand, i))
-    if not cands:
-        return seq, None
-    best = choose_best_by_rule_then_tie([c for c, _ in cands], rp, tie_scorer)
-    if best != seq:
-        pos = next(i for (c, i) in cands if c == best)
-        return best, f"{residue}@{pos+1}"
-    return seq, None
-
-
-def ensure_internal_c(
-    seq: str, rp: RuleParams, min_gap: int, tie_scorer=None
-) -> Tuple[str, Optional[str]]:
-    if "C" in seq[1:-1]:
-        return seq, None
-    avoid = avoid_positions_near_P(seq, min_gap)
-    idxP = [i for i, a in enumerate(seq) if a == "P"]
-    bad_pre = {i - 1 for i in idxP if i - 1 >= 1}
-    avoid.update(bad_pre)
-    candidates_priority = []
-    for i in range(1, len(seq) - 1):
-        if i in avoid:
-            continue
-        a = seq[i]
-        if a in ("P", "M"):
-            continue
-        prio = 2 if a in rp.bad_internal else 1
-        candidates_priority.append((prio, i))
-    if not candidates_priority:
-        return seq, None
-    for pr in (2, 1):
-        idxs = [i for p, i in candidates_priority if p == pr]
-        cands = [seq[:i] + "C" + seq[i + 1 :] for i in idxs]
-        if not cands:
-            continue
-        best = choose_best_by_rule_then_tie(cands + [seq], rp, tie_scorer)
-        if best != seq:
-            pos = next(i for i in idxs if seq[:i] + "C" + seq[i + 1 :] == best)
-            return best, f"C@{pos+1}"
-    return seq, None
-
-
-def ensure_c_anywhere_for_frameshift(
-    seq: str, rp: RuleParams, tie_scorer=None
-) -> Tuple[str, Optional[str]]:
-    """For frameshifts: allow C placement at ANY position (including terminals)."""
-    if "C" in seq:
-        return seq, None
-    cands = []
-    for i in range(0, len(seq)):
-        if seq[i] == "C":
-            continue
-        cand = seq[:i] + "C" + seq[i + 1 :]
-        cands.append((cand, i))
-    if not cands:
-        return seq, None
-    best = choose_best_by_rule_then_tie([c for c, _ in cands], rp, tie_scorer)
-    if best != seq:
-        pos = next(i for (c, i) in cands if c == best)
-        return best, f"C@{pos+1}"
-    return seq, None
-
-
-def edit_proline(
-    seq: str, rp: RuleParams, ep: EditParams, tie_scorer=None
-) -> Tuple[str, Optional[str]]:
-    if "P" in seq[1:-1]:
-        return seq, None
-    best, label = best_single_sub_for_residue(
-        seq, "P", rp, avoid_idx=None, tie_scorer=tie_scorer
-    )
-    return best, (label or "P")
-
-
-def edit_methionine(
-    seq: str, rp: RuleParams, ep: EditParams, tie_scorer=None
-) -> Tuple[str, Optional[str]]:
-    if "M" in seq[1:-1]:
-        return seq, None
-    avoid = avoid_positions_near_P(seq, ep.rule_flank_gap_min)
-    best, label = best_single_sub_for_residue(
-        seq, "M", rp, avoid_idx=avoid, tie_scorer=tie_scorer
-    )
-    return best, (label or "M")
-
-
-def edit_cterm(
-    seq: str, rp: RuleParams, ep: EditParams, tie_scorer=None
-) -> Tuple[str, Optional[str]]:
-    if seq[-1] in ep.hydrophobic_cterm_set:
-        return seq, None
-    best = None
-    best_rule = rule_score(seq, rp)["rule_total"]
-    best_label = None
-    for aa in ep.hydrophobic_cterm_set:
-        if aa == seq[-1]:
-            continue
-        cand = seq[:-1] + aa
-        sc = rule_score(cand, rp)["rule_total"]
-        if sc > best_rule or (
-            sc == best_rule
-            and tie_scorer
-            and tie_scorer(cand) > (tie_scorer(best) if best else -1e9)
-        ):
-            best, best_rule, best_label = cand, sc, f"Cterm:{seq[-1]}→{aa}"
-    if best is not None:
-        return best, best_label
-    # fallback forced hydrophobic switch
-    for aa in ep.hydrophobic_cterm_set:
-        if aa != seq[-1]:
-            return seq[:-1] + aa, f"Cterm:{seq[-1]}→{aa}"
-    return seq, None
-
-
-def build_edit_path(
-    seq: str,
-    mut_idx0: Optional[int],
     rp: RuleParams,
     ep: EditParams,
-    tie_scorer=None,
-    is_frameshift: bool = False,
-) -> Tuple[List[str], List[str]]:
-    """
-    Returns (stage_seqs, stage_labels) for stages:
-      [orig, after Nterm, after C, after P, after M, after Cterm]
-    """
-    stage_labels: List[str] = []
-    s0 = seq
+    mut_idx0: Optional[int],
+    wt_aa: Optional[str],
+    mut_aa: Optional[str],
+    is_fs: bool,
+    term_beam: int = 3,
+) -> List[PathState]:
+    """Enumerate N-term then C-term; keep up to top-K by rule_total at each stage, with WT/MUT exclusions at the mutant terminus."""
+    starts: List[Tuple[str, str]] = []
 
-    # Nterm
-    sN, labN = edit_nterm(s0, rp, ep, tie_scorer)
-    stage_labels.append(labN or "Nterm:keep")
-
-    # C (frameshift: anywhere; otherwise mutant->C or ensure internal C)
-    if is_frameshift:
-        sC, labC = ensure_c_anywhere_for_frameshift(sN, rp, tie_scorer)
-        stage_labels.append(labC or "C:keep(fs)")
+    # N-term
+    a0 = seq[0]
+    nterm_keep = (a0 in PROTECTED_SET) or (a0 in rp.nterm_good)
+    if nterm_keep:
+        nterm_cands = [(seq, "Nterm:keep")]
     else:
-        sC, labC, _applied_at_mut = edit_mutant_to_c(sN, mut_idx0)
-        if not labC:
-            sC2, labC2 = ensure_internal_c(sC, rp, ep.rule_flank_gap_min, tie_scorer)
-            if labC2:
-                sC, labC = sC2, labC2
-        stage_labels.append(labC or "C:keep")
+        targets = [t for t in ep.nterm_targets if t != a0]
+        if not is_fs and mut_idx0 == 0:
+            targets = [t for t in targets if t != (wt_aa or "") and t != (mut_aa or "")]
+        opts = [t + seq[1:] for t in targets] + [seq]
+        scored = [
+            (
+                s,
+                f"Nterm:{a0}→{s[0]}" if s != seq else "Nterm:keep",
+                rule_score(s, rp)["rule_total"],
+            )
+            for s in opts
+        ]
+        scored.sort(key=lambda x: x[2], reverse=True)
+        best = scored[0][2]
+        nterm_cands = [(s, l) for (s, l, r) in scored if r == best][: max(1, term_beam)]
 
-    # P
-    sP, labP = edit_proline(sC, rp, ep, tie_scorer)
-    stage_labels.append(labP or "P:keep")
+    # C-term
+    out_states: List[PathState] = []
+    for sN, labN in nterm_cands:
+        last = sN[-1]
+        cterm_keep = (
+            (last in PROTECTED_SET) or (last == "A") or (last in AA_HYDRO_CTERM)
+        )
+        if cterm_keep:
+            cterm_cands = [(sN, "Cterm:keep")]
+        else:
+            hydros = [aa for aa in AA_HYDRO_CTERM if aa != last]
+            if not is_fs and mut_idx0 == len(sN) - 1:
+                hydros = [
+                    aa for aa in hydros if aa != (wt_aa or "") and aa != (mut_aa or "")
+                ]
+            tries = [sN[:-1] + aa for aa in hydros] + [sN]
+            scored = [
+                (
+                    s,
+                    f"Cterm:{last}→{s[-1]}" if s != sN else "Cterm:keep",
+                    rule_score(s, rp)["rule_total"],
+                )
+                for s in tries
+            ]
+            scored.sort(key=lambda x: x[2], reverse=True)
+            best = scored[0][2]
+            cterm_cands = [(s, l) for (s, l, r) in scored if r == best][
+                : max(1, term_beam)
+            ]
 
-    # M
-    sM, labM = edit_methionine(sP, rp, ep, tie_scorer)
-    stage_labels.append(labM or "M:keep")
+        for sNT, labT in cterm_cands:
+            out_states.append(
+                PathState(
+                    seq=sNT,
+                    stage_names=["orig", "Nterm", "Cterm"],
+                    stage_seqs=[seq, sN, sNT],
+                    labels=[labN, labT],
+                    tokens=[_compact_token("Nterm", labN)]
+                    * (0 if labN.endswith("keep") else 1)
+                    + (
+                        [_compact_token("Cterm", labT)]
+                        if not labT.endswith("keep")
+                        else []
+                    ),
+                    mut_idx0=mut_idx0,
+                    is_frameshift=bool(is_fs),
+                    wt_aa=wt_aa,
+                    mut_aa=mut_aa,
+                    did_internal_edit=False,
+                )
+            )
+    return out_states
 
-    # Cterm
-    sT, labT = edit_cterm(sM, rp, ep, tie_scorer)
-    stage_labels.append(labT or "Cterm:keep")
 
-    return [s0, sN, sC, sP, sM, sT], stage_labels
+def expand_stage(state: PathState, stage: str, rp: RuleParams, args) -> List[PathState]:
+    """Expand by one internal stage respecting skip‑if‑met and mutant‑first rules."""
+    s = state.seq
+    L = len(s)
+    out: List[PathState] = []
+
+    def _keep():
+        out.append(state.extend(stage, s, f"{stage}:keep", edited=False))
+
+    internal = s[1:-1]
+
+    # --- skip criteria (criterion already met) ---
+    if stage == "P" and ("P" in internal):
+        _keep()
+        return out
+    if stage == "C" and ("C" in internal):
+        _keep()
+        return out
+    if stage == "M" and ("M" in internal):
+        _keep()
+        return out
+    if stage == "RK":
+        # NEW: skip RK if an internal R/K already exists OR any R exists anywhere (incl. termini)
+        if any(a in ("R", "K") for a in internal) or ("R" in s):
+            _keep()
+            return out
+
+    # special-case: mutation P->C means skip C stage entirely
+    if (
+        (not state.is_frameshift)
+        and stage == "C"
+        and (state.wt_aa == "P" and state.mut_aa == "C")
+    ):
+        _keep()
+        return out
+
+    # helper: allowed positions
+    p_idxs = [i for i in range(1, L - 1) if s[i] == "P"]
+    disallowed = set()
+    # never edit residue immediately before a Proline
+    for p in p_idxs:
+        if p - 1 >= 1:
+            disallowed.add(p - 1)
+
+    def _range_all():
+        return [
+            i
+            for i in range(1, L - 1)
+            if i not in disallowed and s[i] not in PROTECTED_SET
+        ]
+
+    # P placement window (fixed: correct upper/lower bounds to enforce 1-based [4..n-2])
+    if stage == "P":
+        # 1-based [4..n-2] -> 0-based [3..L-3]; also clamp CLI to spec
+        lo = max(3, int(args.p_position_min) - 1)
+        hi = L - 3
+        allowed = [
+            i
+            for i in range(lo, hi + 1)
+            if i not in disallowed and s[i] not in PROTECTED_SET and s[i] != "P"
+        ]
+    else:
+        allowed = [i for i in _range_all()]
+
+    # optional: split preference around P (we consider BOTH orientations; preference is a rule bonus)
+    # We therefore do not prune to only one side; we just avoid forbidden edits.
+
+    # never overwrite existing stage residue; never set to WT/MUT at the mutant site
+    def _positions_for_target(target_aa: str) -> List[int]:
+        pos = []
+        for i in allowed:
+            if s[i] == target_aa:
+                continue
+            if (
+                (not state.is_frameshift)
+                and (state.mut_idx0 is not None)
+                and (i == int(state.mut_idx0))
+            ):
+                if target_aa in ((state.wt_aa or ""), (state.mut_aa or "")):
+                    continue
+            pos.append(i)
+        return pos
+
+    def _apply_at(i: int, aa: str, label_aa: Optional[str] = None, edited=True):
+        new = s[:i] + aa + s[i + 1 :]
+        lab = f"{(label_aa or aa)}@{i+1}"
+        out.append(state.extend(stage, new, lab, edited=edited))
+
+    # --- first internal edit must be at mutant site (if non‑FS and none done) ---
+    first_internal_needed = (
+        (not state.is_frameshift)
+        and (not state.did_internal_edit)
+        and (state.mut_idx0 is not None)
+        and (0 < int(state.mut_idx0) < L - 1)
+    )
+
+    if stage == "P":
+        target = "P"
+        if first_internal_needed:
+            mi = int(state.mut_idx0)
+            if (
+                mi in allowed
+                and s[mi] not in PROTECTED_SET
+                and s[mi] != "P"
+                and target not in ((state.wt_aa or ""), (state.mut_aa or ""))
+            ):
+                _apply_at(mi, "P")
+                return out
+            _keep()
+            return out  # cannot legally place P at mut site as the first internal edit
+        for i in _positions_for_target("P"):
+            _apply_at(i, "P")
+        if len(out) == 0:
+            _keep()
+        return out
+
+    if stage in ("C", "M"):
+        target = stage
+        if first_internal_needed:
+            mi = int(state.mut_idx0)
+            if target in ((state.wt_aa or ""), (state.mut_aa or "")):
+                _keep()
+                return out
+            if mi in _positions_for_target(target):
+                _apply_at(mi, target)
+                return out
+            _keep()
+            return out
+        for i in _positions_for_target(target):
+            _apply_at(i, target)
+        if len(out) == 0:
+            _keep()
+        return out
+
+    if stage == "RK":
+        if first_internal_needed:
+            mi = int(state.mut_idx0)
+            options = []
+            for aa in ("R", "K"):
+                if aa in ((state.wt_aa or ""), (state.mut_aa or "")):
+                    continue
+                if mi in _positions_for_target(aa):
+                    options.append((mi, aa))
+            if options:
+                for i, aa in options:
+                    _apply_at(i, aa, label_aa=aa)
+                return out
+            _keep()
+            return out
+        for i in allowed:
+            if s[i] in PROTECTED_SET:
+                continue
+            for aa in ("R", "K"):
+                if s[i] == aa:
+                    continue
+                _apply_at(i, aa, label_aa=aa)
+        if len(out) == 0:
+            _keep()
+        return out
+
+    _keep()
+    return out
 
 
 # =============================================================================
-# Tie-breaker & final scoring
+# Tie-breaker & final scoring (for permutation winners only)
 # =============================================================================
+
+
 def parse_weight_map(s: Optional[str]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     if not s:
@@ -902,170 +1281,379 @@ def fly_surface_norm(seq: str) -> float:
     return float(min(1.0, max(0.0, (gravy + 4.5) / 9.0)))
 
 
-def aa_type_metric(seq: str) -> float:
-    counts = {}
-    for a in seq:
-        counts[a] = counts.get(a, 0) + 1
-    n = len(seq)
-    if n == 0:
-        return 0.0
-    H = 0.0
-    for c in counts.values():
-        p = c / n
-        H -= p * math.log(p + 1e-12)
-    Hmax = math.log(min(len(AA), n))
-    return H / Hmax if Hmax > 0 else 0.0
+def internal_basic_h_sulfur_metrics(seq: str) -> Dict[str, float]:
+    core = seq[1:-1] if len(seq) > 2 else ""
+    rk = sum(ch in ("R", "K") for ch in core)
+    h = sum(ch == "H" for ch in core)
+    s_count = sum(ch in ("C", "M") for ch in seq)
+    L = max(1, len(seq))
+    return {
+        "rk_internal": float(rk),
+        "h_internal": float(h),
+        "protons_score": float(rk) + 0.5 * float(h),
+        "sulfur_frac": float(s_count) / float(L),
+        "hydro_frac": hydrophobic_fraction(seq),
+    }
 
 
-def combine_tie_breaker(
-    weights: Dict[str, float],
-    hydro_norm: float,
-    conf_norm: float,
-    hk_norm: float,
-    polymer_weight: float,
-    aa_types_norm: float,
-) -> float:
-    """Continuous composite for ranking/tie-breaking. 'term' weight maps to HK k-mer norm."""
-    fly = math.sqrt(max(hydro_norm, 0.0) ** 2 + max(conf_norm, 0.0) ** 2)
-    return (
-        weights.get("fly", 0.0) * fly
-        + weights.get("hydro", 0.0) * hydro_norm
-        + weights.get("conf_mz", 0.0) * conf_norm
-        + weights.get("term", 0.0) * hk_norm
-        + weights.get("polymer", 0.0)
-        * (polymer_weight if np.isfinite(polymer_weight) else 0.0)
-        + weights.get("types", 0.0) * aa_types_norm
-    )
+def _warn_if_fraction(name, arr):
+    if len(arr) == 0:
+        return
+    m, M = float(np.nanmin(arr)), float(np.nanmax(arr))
+    if m < -1e-6 or M > 1 + 1e-6:
+        LOG.warning(f"[units] {name} expected in [0,1] but spans [{m:.3f}, {M:.3f}]")
+
+
+def _warn_if_integerish(name, arr):
+    if len(arr) == 0:
+        return
+    dif = np.nanmax(np.abs(arr - np.rint(arr)))
+    if dif > 1e-6:
+        LOG.warning(
+            f"[units] {name} expected integer-valued but non-integer deltas up to {dif:.3g}"
+        )
 
 
 # =============================================================================
-# Plotting helpers (classic edit-path + dense-aware)
+# Plotting helpers (full-sequence colored per stage)
 # =============================================================================
-STAGE_POINT_COLORS = {
+
+STAGE_COLOR = {
     "orig": "#000000",
     "Nterm": "#6a3d9a",
-    "C": "#1f77b4",
-    "P": "#ff7f0e",
-    "M": "#2ca02c",
     "Cterm": "#d62728",
+    "P": "#ff7f0e",
+    "C": "#1f77b4",
+    "M": "#2ca02c",
+    "RK": "#8c564b",
 }
-STAGE_LIST = ["orig", "Nterm", "C", "P", "M", "Cterm"]
+BG_COLORS = {
+    "orig_not_hit": "#7f7f7f",
+    "orig_hit": "#9467bd",
+    "decoys_not_selected": "#9ecae1",
+    "decoys_selected": "#e41a1c",
+}
+MONO_FONT_SIZE = 8
 
 
 def _grid(ax):
     ax.grid(True, ls="--", lw=0.5, alpha=0.5)
 
 
-def truncate_seq(s: str, maxlen: int = 36) -> str:
+def truncate_seq(s: str, maxlen: int = 48) -> str:
     if len(s) <= maxlen:
         return s
-    keep = max(6, (maxlen - 3) // 2)
+    keep = max(8, (maxlen - 3) // 2)
     return f"{s[:keep]}…{s[-keep:]}"
 
 
-def hex_or_scatter_background(ax, x, y, n_points: int, dense_threshold: int = 1500):
-    if n_points > dense_threshold:
-        hb = ax.hexbin(x, y, gridsize=60, bins="log", alpha=0.9)
-        cb = plt.colorbar(hb, ax=ax)
-        cb.set_label("log10(count)")
-    else:
-        ax.scatter(x, y, s=10, alpha=0.25, label=f"not selected (n={n_points})")
+def _build_ledger_history(
+    stage_seqs: List[str], stage_names: List[str]
+) -> List[List[Optional[str]]]:
+    if not stage_seqs:
+        return []
+    L = len(stage_seqs[0])
+    ledgers = []
+    cur = [None] * L
+    ledgers.append(cur.copy())
+    for k in range(1, len(stage_seqs)):
+        prev, curseq, stage = stage_seqs[k - 1], stage_seqs[k], stage_names[k]
+        for i, (a, b) in enumerate(zip(prev, curseq)):
+            if a != b:
+                cur[i] = stage
+        ledgers.append(cur.copy())
+    return ledgers
 
 
-def classic_edit_path_plot(
+def _draw_full_sequence(ax, x, y, seq: str, ledger: List[Optional[str]]):
+    xoff = 6
+    yoff = -14
+    for i, ch in enumerate(seq):
+        tag = ledger[i] if i < len(ledger) else None
+        color = STAGE_COLOR.get(tag or "orig", "#000000")
+        ax.annotate(
+            ch,
+            (x, y),
+            textcoords="offset points",
+            xytext=(xoff + i * 7, yoff),
+            fontsize=MONO_FONT_SIZE,
+            family="monospace",
+            color=color,
+            zorder=4,
+        )
+
+
+def edit_path_plot_colored(
     outdir: str,
-    idx_or_rank: int,
+    rank_idx: int,
     selected_flag: bool,
-    seqs: List[str],
-    xvals: List[float],  # hydro (fly surface norm)
-    yvals: List[float],  # confusability score
+    stage_names: List[str],
+    xvals: List[float],
+    yvals: List[float],
+    stage_seqs: List[str],
     title_extra: str = "",
-    max_label_len: int = 36,
+    label_len: int = 48,
+    edge_labels: Optional[List[str]] = None,  # NEW: show actual op label per step
 ):
-    """Classic path: confusability vs hydrophobicity (fly surface norm) with stage colors."""
     ensure_outdir(outdir)
     fig, ax = plt.subplots()
-    # Lines between stages
-    for i in range(len(STAGE_LIST) - 1):
+
+    for i in range(len(stage_names) - 1):
         ax.plot(
             [xvals[i], xvals[i + 1]],
             [yvals[i], yvals[i + 1]],
             lw=1.4,
             color="#777777",
             alpha=0.9,
+            zorder=1,
         )
-    # Points + labels
-    for i, st in enumerate(STAGE_LIST):
+
+    ledgers = _build_ledger_history(stage_seqs, stage_names)
+
+    for i, st in enumerate(stage_names):
+        c = STAGE_COLOR.get(st, "#444444")
         ax.scatter(
             [xvals[i]],
             [yvals[i]],
-            s=42,
-            color=STAGE_POINT_COLORS[st],
+            s=50 if i == len(stage_names) - 1 else 44,
+            color=c,
             edgecolor="k",
             linewidths=0.6,
             zorder=3,
         )
+        # Annotate with stage AND edge label for clarity (no label for origin)
+        node_label = st
+        if edge_labels and i > 0 and (i - 1) < len(edge_labels):
+            node_label = f"\n{edge_labels[i - 1]}"
+        print(node_label)
         ax.annotate(
-            st,
+            node_label,
             (xvals[i], yvals[i]),
             textcoords="offset points",
             xytext=(6, 6),
             fontsize=8,
-            color=STAGE_POINT_COLORS[st],
+            color=c,
         )
-    # Titles
-    ax.set_xlabel("fly_surface_norm (KD-normalized)")
-    ax.set_ylabel("confusability score (multi-set)")
-    seq0, seqF = seqs[0], seqs[-1]
-    ttl1 = f"Edit path (orig → Nterm → C → P → M → Cterm) [{'SELECTED' if selected_flag else 'not selected'}]"
-    ttl2 = f"orig: {truncate_seq(seq0)}  →  final: {truncate_seq(seqF)}"
+        _draw_full_sequence(
+            ax, xvals[i], yvals[i], truncate_seq(stage_seqs[i], label_len), ledgers[i]
+        )
+
+    ax.set_xlabel("fly_surface_norm (0–1, KD-normalized)")
+    ax.set_ylabel("confusability (0–1)")
+    ttl1 = f"R{rank_idx:03d} — Edit path"
+    ttl2 = f"orig: {truncate_seq(stage_seqs[0], label_len)}  →  final: {truncate_seq(stage_seqs[-1], label_len)}"
     if title_extra:
         ttl2 += f"  |  {title_extra}"
     ax.set_title(ttl1 + "\n" + ttl2)
+
+    for name in ["Nterm", "Cterm", "P", "C", "M", "RK"]:
+        ax.scatter(
+            [], [], color=STAGE_COLOR[name], label=name, edgecolor="k", linewidths=0.4
+        )
+    ax.legend(frameon=True, fontsize=8)
+
     _grid(ax)
     fig.tight_layout()
-    fname = f"path_{idx_or_rank:04d}__{'SEL' if selected_flag else 'NOT'}.png"
+    fname = f"R{rank_idx:03d}__score_{title_extra.replace('Δscore=','').replace(' ','_')}__{'SEL' if selected_flag else 'NOT'}.png"
     fig.savefig(os.path.join(outdir, fname), dpi=150)
     plt.close(fig)
 
 
-def density_scatter_sel_vs_not(
-    df: pd.DataFrame,
-    x: str,
-    y: str,
-    selcol: str,
+# =============================================================================
+# Plotting helpers (extracted orchestration)
+# =============================================================================
+
+
+def plot_orig_vs_decoy_scores(
+    df_dec: pd.DataFrame,
     outpath: str,
+    *,
+    selected_col: str = "selected",
+    orig_score_col: str = "start_score",
+    decoy_score_col: str = "final_score",
+    title: str = "Original vs decoy composite score",
     dense_threshold: int = 1500,
-    title: Optional[str] = None,
-):
-    if df.empty or x not in df.columns or y not in df.columns:
+) -> None:
+    """
+    Scatter (or hex) plot of original peptide's score vs cognate decoy's score.
+    Highlights selected decoys.
+
+    Expects each decoy row to carry the *original* peptide's score in `orig_score_col`
+    (e.g., start_score) and its own decoy score in `decoy_score_col` (e.g., final_score).
+    """
+    # Sanity checks / safe subset
+    if (orig_score_col not in df_dec.columns) or (
+        decoy_score_col not in df_dec.columns
+    ):
         return
+    d = df_dec[[orig_score_col, decoy_score_col, selected_col]].copy()
+    d = d.dropna(subset=[orig_score_col, decoy_score_col])
+    if d.empty:
+        return
+
+    # Basic masks
+    sel_mask = (
+        d[selected_col] == True
+        if selected_col in d.columns
+        else pd.Series(False, index=d.index)
+    )
+    nsel_mask = ~sel_mask
+
+    x = d[orig_score_col].to_numpy(float)
+    y = d[decoy_score_col].to_numpy(float)
+    x_sel, y_sel = x[sel_mask.to_numpy()], y[sel_mask.to_numpy()]
+    x_nsel, y_nsel = x[nsel_mask.to_numpy()], y[nsel_mask.to_numpy()]
+
+    # Figure
     fig, ax = plt.subplots()
-    msel = df[selcol] == True
-    non = df.loc[~msel]
-    sel = df.loc[msel]
-    if len(non):
-        hex_or_scatter_background(
-            ax,
-            non[x].to_numpy(float),
-            non[y].to_numpy(float),
-            len(non),
-            dense_threshold,
+
+    # If very dense, use a hexbin background for the *non-selected* cloud
+    total_pts = len(x)
+    used_hexbin = False
+    if total_pts >= dense_threshold and len(x_nsel) > 0:
+        hb = ax.hexbin(
+            x_nsel,
+            y_nsel,
+            gridsize=50,
+            mincnt=1,
+            linewidths=0.0,
+            alpha=0.7,
         )
-    if len(sel):
+        used_hexbin = True
+        # Add a colorbar only if helpful
+        cb = fig.colorbar(hb, ax=ax)
+        cb.set_label("count (non-selected)")
+    else:
+        # Regular scatter for non-selected
+        if len(x_nsel):
+            ax.scatter(
+                x_nsel,
+                y_nsel,
+                s=12,
+                alpha=0.45,
+                label=f"Decoys (not selected, n={len(x_nsel)})",
+                color=BG_COLORS.get("decoys_not_selected", "#9e9e9e"),
+            )
+
+    # Selected overlay (always as points)
+    if len(x_sel):
         ax.scatter(
-            sel[x],
-            sel[y],
-            s=20,
-            alpha=0.95,
-            label=f"selected (n={len(sel)})",
+            x_sel,
+            y_sel,
+            s=22,
+            alpha=0.9,
+            label=f"Decoys (selected, n={len(x_sel)})",
+            color=BG_COLORS.get("decoys_selected", "#ff7f0e"),
+            edgecolor="k",
+            linewidths=0.4,
+            zorder=3,
+        )
+
+    # y=x reference line
+    xmin, xmax = np.nanmin(x), np.nanmax(x)
+    ymin, ymax = np.nanmin(y), np.nanmax(y)
+    lo = np.nanmin([xmin, ymin])
+    hi = np.nanmax([xmax, ymax])
+    ax.plot([lo, hi], [lo, hi], ls="--", lw=1.0, color="#555555", alpha=0.9, zorder=2)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+
+    # Correlations (optional; shown in subtitle)
+    try:
+        if total_pts >= 3:
+            r_pear = np.corrcoef(x, y)[0, 1]
+            # Spearman is more robust if ranks tie; fall back gracefully
+            from scipy.stats import spearmanr  # optional dep, ignore if unavailable
+
+            r_spear = spearmanr(x, y, nan_policy="omit").statistic
+            subtitle = f"(Pearson r={r_pear:.3f}, Spearman ρ={r_spear:.3f})"
+        else:
+            subtitle = ""
+    except Exception:
+        subtitle = ""
+
+    ax.set_title(f"{title}\n{subtitle}" if subtitle else title)
+    ax.set_xlabel(f"original score [{orig_score_col}]")
+    ax.set_ylabel(f"decoy score [{decoy_score_col}]")
+    if not used_hexbin:
+        ax.legend(frameon=True, fontsize=8)
+
+    _grid(ax)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def plot_scatter_groups(
+    outpath: str,
+    orig_xy: Tuple[np.ndarray, np.ndarray],
+    hit_mask: Optional[np.ndarray],
+    nsel_xy: Tuple[np.ndarray, np.ndarray],
+    sel_xy: Tuple[np.ndarray, np.ndarray],
+    xlabel: str,
+    ylabel: str,
+    title: str,
+    dense_threshold: int = 1500,
+):
+    """
+    Draw three groups: originals (optionally split by hit mask), non‑selected decoys, selected decoys.
+    """
+    fig, ax = plt.subplots()
+    if len(orig_xy[0]):
+        if hit_mask is not None and len(hit_mask) == len(orig_xy[0]):
+            x, y = np.asarray(orig_xy[0]), np.asarray(orig_xy[1])
+            hm = np.asarray(hit_mask, dtype=bool)
+            ax.scatter(
+                x[~hm],
+                y[~hm],
+                s=10,
+                alpha=0.35,
+                label=f"Originals (not hit, n={int((~hm).sum())})",
+                color=BG_COLORS["orig_not_hit"],
+            )
+            ax.scatter(
+                x[hm],
+                y[hm],
+                s=30,
+                alpha=0.85,
+                marker="^",
+                label=f"Originals (hit, n={int(hm.sum())})",
+                color=BG_COLORS["orig_hit"],
+                edgecolor="k",
+                linewidths=0.4,
+            )
+        else:
+            ax.scatter(
+                orig_xy[0],
+                orig_xy[1],
+                s=10,
+                alpha=0.35,
+                label=f"Originals (n={len(orig_xy[0])})",
+                color=BG_COLORS["orig_not_hit"],
+            )
+    if len(nsel_xy[0]):
+        ax.scatter(
+            nsel_xy[0],
+            nsel_xy[1],
+            s=12,
+            alpha=0.45,
+            label=f"Decoys (not selected, n={len(nsel_xy[0])})",
+            color=BG_COLORS["decoys_not_selected"],
+        )
+    if len(sel_xy[0]):
+        ax.scatter(
+            sel_xy[0],
+            sel_xy[1],
+            s=18,
+            alpha=0.80,
+            label=f"Decoys (selected, n={len(sel_xy[0])})",
+            color=BG_COLORS["decoys_selected"],
             edgecolor="k",
             linewidths=0.4,
         )
-    ax.set_xlabel(x)
-    ax.set_ylabel(y)
-    if title:
-        ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
     ax.legend()
     _grid(ax)
     fig.tight_layout()
@@ -1073,48 +1661,251 @@ def density_scatter_sel_vs_not(
     plt.close(fig)
 
 
+def plot_hist(df_dec: pd.DataFrame, col: str, outpath: str, title: str) -> None:
+    """One‑column histogram."""
+    if df_dec.empty or col not in df_dec.columns:
+        return
+    fig, ax = plt.subplots()
+    ax.hist(df_dec[col].dropna().to_numpy(float), bins=30, alpha=0.8, color="#3182bd")
+    ax.set_xlabel(col)
+    ax.set_ylabel("count")
+    ax.set_title(title)
+    _grid(ax)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def render_all_plots(
+    df_dec: pd.DataFrame,
+    outdir: str,
+    trace_label_maxlen: int = 48,
+    dense_threshold: int = 1500,
+    no_progress: bool = False,
+) -> None:
+    """Render edit‑path plots, scatters, and histograms into <outdir>/plots/."""
+    plots_dir = os.path.join(outdir, "plots")
+    ep_dir = os.path.join(plots_dir, "edit_paths")
+    ensure_outdir(ep_dir)
+
+    df_plot = (
+        df_dec.copy().sort_values("final_score", ascending=False).reset_index(drop=True)
+    )
+
+    it = df_plot.itertuples(index=False)
+    if not no_progress:
+        it = tqdm(it, total=len(df_plot), desc="EditPaths(global)")
+
+    for rank, rr in enumerate(it, start=1):
+        stages = rr.path_stages.split("|") if rr.path_stages else ["orig"]
+        seqs = rr.path_seqs.split("|") if rr.path_seqs else [rr.peptide]
+        xvals = [float(x) for x in rr.path_fly.split("|")] if rr.path_fly else [rr.fly0]
+        yvals = (
+            [float(y) for y in rr.path_conf.split("|")] if rr.path_conf else [rr.conf0]
+        )
+        edge_labels = rr.edit_path.split(" → ") if rr.edit_path else []
+        edit_path_plot_colored(
+            ep_dir,
+            rank_idx=rank,
+            selected_flag=bool(rr.selected),
+            stage_names=stages,
+            xvals=xvals,
+            yvals=yvals,
+            stage_seqs=seqs,
+            title_extra=f"Δscore={rr.delta_total_score:.3f}",
+            label_len=trace_label_maxlen,
+            edge_labels=edge_labels,
+        )
+
+    orig_hit_mask = (
+        df_dec["is_hit"].to_numpy(bool) if "is_hit" in df_dec.columns else None
+    )
+    sel_mask = df_dec["selected"] == True
+    nsel_mask = ~sel_mask
+
+    plot_scatter_groups(
+        outpath=os.path.join(plots_dir, "scatter_rk_internal_vs_hydro.png"),
+        orig_xy=(
+            df_dec["rk_internal0"].to_numpy(float),
+            df_dec["hydrophobic_fraction0"].to_numpy(float),
+        ),
+        hit_mask=orig_hit_mask,
+        nsel_xy=(
+            df_dec.loc[nsel_mask, "rk_internal"].to_numpy(float),
+            df_dec.loc[nsel_mask, "hydrophobic_fraction"].to_numpy(float),
+        ),
+        sel_xy=(
+            df_dec.loc[sel_mask, "rk_internal"].to_numpy(float),
+            df_dec.loc[sel_mask, "hydrophobic_fraction"].to_numpy(float),
+        ),
+        xlabel="internal R/K count (integer)",
+        ylabel="hydrophobic fraction (0–1)",
+        title="Internal basic sites vs hydrophobicity",
+        dense_threshold=dense_threshold,
+    )
+    plot_scatter_groups(
+        outpath=os.path.join(plots_dir, "scatter_protons_vs_conf.png"),
+        orig_xy=(
+            df_dec["protons_score0"].to_numpy(float),
+            df_dec["conf0"].to_numpy(float),
+        ),
+        hit_mask=orig_hit_mask,
+        nsel_xy=(
+            df_dec.loc[nsel_mask, "protons_score"].to_numpy(float),
+            df_dec.loc[nsel_mask, "confT"].to_numpy(float),
+        ),
+        sel_xy=(
+            df_dec.loc[sel_mask, "protons_score"].to_numpy(float),
+            df_dec.loc[sel_mask, "confT"].to_numpy(float),
+        ),
+        xlabel="side‑chain protons score (R/K + 0.5·H; count‑like)",
+        ylabel="confusability (0–1)",
+        title="Protons on side chains vs confusability",
+        dense_threshold=dense_threshold,
+    )
+    plot_scatter_groups(
+        outpath=os.path.join(plots_dir, "scatter_sulfur_vs_hydro.png"),
+        orig_xy=(
+            df_dec["sulfur_frac0"].to_numpy(float),
+            df_dec["hydrophobic_fraction0"].to_numpy(float),
+        ),
+        hit_mask=orig_hit_mask,
+        nsel_xy=(
+            df_dec.loc[nsel_mask, "sulfur_frac"].to_numpy(float),
+            df_dec.loc[nsel_mask, "hydrophobic_fraction"].to_numpy(float),
+        ),
+        sel_xy=(
+            df_dec.loc[sel_mask, "sulfur_frac"].to_numpy(float),
+            df_dec.loc[sel_mask, "hydrophobic_fraction"].to_numpy(float),
+        ),
+        xlabel="S-content fraction (C+M)/length (0–1)",
+        ylabel="hydrophobic fraction (0–1)",
+        title="S-content vs hydrophobicity",
+        dense_threshold=dense_threshold,
+    )
+    plot_scatter_groups(
+        outpath=os.path.join(plots_dir, "scatter_fly_vs_conf.png"),
+        orig_xy=(df_dec["fly0"].to_numpy(float), df_dec["conf0"].to_numpy(float)),
+        hit_mask=orig_hit_mask,
+        nsel_xy=(
+            df_dec.loc[nsel_mask, "flyT"].to_numpy(float),
+            df_dec.loc[nsel_mask, "confT"].to_numpy(float),
+        ),
+        sel_xy=(
+            df_dec.loc[sel_mask, "flyT"].to_numpy(float),
+            df_dec.loc[sel_mask, "confT"].to_numpy(float),
+        ),
+        xlabel="fly_surface_norm (0–1)",
+        ylabel="confusability (0–1)",
+        title="Confusability vs flyability",
+        dense_threshold=dense_threshold,
+    )
+    plot_scatter_groups(
+        outpath=os.path.join(plots_dir, "scatter_final_vs_fly.png"),
+        orig_xy=(df_dec["fly0"].to_numpy(float), df_dec["start_score"].to_numpy(float)),
+        hit_mask=orig_hit_mask,
+        nsel_xy=(
+            df_dec.loc[nsel_mask, "flyT"].to_numpy(float),
+            df_dec.loc[nsel_mask, "final_score"].to_numpy(float),
+        ),
+        sel_xy=(
+            df_dec.loc[sel_mask, "flyT"].to_numpy(float),
+            df_dec.loc[sel_mask, "final_score"].to_numpy(float),
+        ),
+        xlabel="fly_surface_norm (0–1)",
+        ylabel="composite score (arbitrary units)",
+        title="Composite score vs flyability",
+        dense_threshold=dense_threshold,
+    )
+    plot_scatter_groups(
+        outpath=os.path.join(plots_dir, "scatter_final_vs_conf.png"),
+        orig_xy=(
+            df_dec["conf0"].to_numpy(float),
+            df_dec["start_score"].to_numpy(float),
+        ),
+        hit_mask=orig_hit_mask,
+        nsel_xy=(
+            df_dec.loc[nsel_mask, "confT"].to_numpy(float),
+            df_dec.loc[nsel_mask, "final_score"].to_numpy(float),
+        ),
+        sel_xy=(
+            df_dec.loc[sel_mask, "confT"].to_numpy(float),
+            df_dec.loc[sel_mask, "final_score"].to_numpy(float),
+        ),
+        xlabel="confusability (0–1)",
+        ylabel="composite score (arbitrary units)",
+        title="Composite score vs confusability",
+        dense_threshold=dense_threshold,
+    )
+
+    plot_orig_vs_decoy_scores(
+        df_dec=df_dec,
+        outpath=os.path.join(plots_dir, "scatter_orig_vs_decoy_scores.png"),
+        selected_col="selected",
+        orig_score_col="start_score",  # original peptide’s composite score column
+        decoy_score_col="final_score",  # cognate decoy’s composite score column
+        title="Original vs cognate decoy scores",
+        dense_threshold=dense_threshold,
+    )
+    plot_hist(
+        df_dec,
+        "delta_total_score",
+        os.path.join(plots_dir, "hist_delta_total_score.png"),
+        "Distribution of final score improvements",
+    )
+    plot_hist(
+        df_dec,
+        "rule_delta",
+        os.path.join(plots_dir, "hist_rule_delta.png"),
+        "Distribution of rule score changes",
+    )
+
+
 # =============================================================================
 # CLI
 # =============================================================================
+
+
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Decoy generation with rule+continuous features, HK k-mer parity, frameshifts, and classic edit-path plots",
+        description="Decoy generation (RULE-FIRST permutations; mutation-aware; charge heuristic; unit-consistent plots)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # I/O
+    # I/O & indexing
     p.add_argument("--in", dest="input_csv", required=True, help="Input CSV")
     p.add_argument("--outdir", required=True, help="Output directory")
     p.add_argument(
-        "--peptide-col",
-        default="peptide",
-        help="Column containing the peptide sequence",
+        "--peptide-col", default="peptide", help="Column with peptide sequence"
     )
     p.add_argument(
-        "--mut-idx-col",
-        default=None,
-        help="Column with 0-based mutation index (preferred)",
+        "--mut-idx-col", default=None, help="0-based mutant index (peptide coordinate)"
     )
     p.add_argument(
         "--pos-col",
         default=None,
-        help="Integer position column (will be converted by --indexing)",
+        help="Peptide position column (interpreted by --indexing)",
     )
     p.add_argument(
         "--mut-notation-col",
         default=None,
-        help="Mutation notation (e.g., L858R, p.G12D, p.G12fs*) — 'fs' triggers frameshift mode",
+        help="Peptide-coordinate mutation notation (e.g., p.G5D, MAP2_fs)",
     )
     p.add_argument(
         "--indexing",
         choices=["0", "1", "C1"],
-        default="C1",
-        help="How to interpret positions",
+        default="1",
+        help="Position interpretation: 0=N-term 0-based; 1=N-term 1-based; C1=1-based from C-term (1=last)",
     )
     p.add_argument(
         "--require-mut-idx0",
         type=int,
         default=1,
-        help="1=fail when mut_idx0 missing/invalid (non-frameshifts only); 0=auto",
+        help="1=fail when mut_idx0 missing/invalid (non-frameshifts); 0=auto-place near middle",
+    )
+    p.add_argument(
+        "--is-hit-col",
+        default="is_hit",
+        help="Optional boolean/0-1 column marking original hits (for overlay in plots)",
     )
 
     # Sets
@@ -1139,10 +1930,13 @@ def make_parser() -> argparse.ArgumentParser:
         "--ppm-tol",
         type=float,
         default=30.0,
-        help="PPM tolerance for general m/z matching",
+        help="PPM tolerance for precursor/fragment matching",
     )
     p.add_argument(
-        "--good-ppm-strict", type=float, default=10.0, help="PPM for strong matches"
+        "--good-ppm-strict",
+        type=float,
+        default=10.0,
+        help="PPM threshold for strong matches",
     )
     p.add_argument(
         "--fragment-kmin", type=int, default=2, help="Min fragment length (k)"
@@ -1171,23 +1965,23 @@ def make_parser() -> argparse.ArgumentParser:
         default="carbamidomethyl",
         help="Fixed mod on Cys",
     )
-    p.add_argument("--charges", default="2,3", help="Precursor charges")
-    p.add_argument("--frag-charges", default="1,2,3", help="Fragment charges")
+
+    # Charges (legacy fallback)
     p.add_argument(
-        "--xle-collapse",
-        action="store_true",
-        help="Collapse I/L to J for legacy kmers (unused now)",
+        "--charges",
+        default="2,3",
+        help="Fallback precursor charges (used if predictor disabled)",
     )
     p.add_argument(
-        "--strict-use-rt",
-        action="store_true",
-        help="When listing proteins, require RT-gated precursors",
+        "--frag-charges",
+        default="1,2,3",
+        help="Fallback fragment charges (used if predictor disabled)",
     )
     p.add_argument(
         "--frag-types-req",
         type=int,
         default=3,
-        help="Min distinct (ion,k,z) fragment types for strong match",
+        help="Min distinct (ion,k,z) for strong match",
     )
 
     # PEG config
@@ -1206,42 +2000,102 @@ def make_parser() -> argparse.ArgumentParser:
         help="≤ this ppm → polymer_match_flag=1",
     )
 
-    # Rules (per spec)
+    # Rules
     p.add_argument("--nterm-good", default="RYLFDM")
-    p.add_argument("--nterm-bad-strong", default="KP")  # K/P = -2
-    p.add_argument("--nterm-bad-weak", default="STVA")  # S/T/V/A = -1
-    p.add_argument("--nterm-targets", default="RYLFDM")  # preferred N-term
+    p.add_argument("--nterm-bad-strong", default="KP")
+    p.add_argument("--nterm-bad-weak", default="STVA")
+    p.add_argument("--nterm-targets", default="RYLFDM")
     p.add_argument("--bad-internal", default="Q")
     p.add_argument("--rule-flank-gap-min", type=int, default=2)
 
-    # Rankings / tie-break
+    # Beam & preferences
+    p.add_argument(
+        "--term-beam",
+        type=int,
+        default=3,
+        help="Top-K terminal variants kept by rule score per terminal stage",
+    )
+    p.add_argument(
+        "--beam-internal",
+        type=int,
+        default=128,
+        help="Beam width for internal-stage frontiers per permutation",
+    )
+    p.add_argument(
+        "--hydro-internal-min",
+        type=int,
+        default=4,
+        help="≥ this many internal hydrophobics earns a small bonus",
+    )
+    p.add_argument(
+        "--hydro-internal-bonus",
+        type=float,
+        default=0.5,
+        help="Rule bonus if internal hydrophobics ≥ threshold",
+    )
+    p.add_argument(
+        "--cm-split-bonus",
+        type=float,
+        default=0.25,
+        help="Rule bonus if C and M lie on opposite sides of a P",
+    )
+    p.add_argument(
+        "--p-position-min",
+        type=int,
+        default=4,
+        help="Earliest 1-based P position allowed (max is n-2)",
+    )
+
+    # Charge predictor & fragment pruning
+    p.add_argument(
+        "--use-charge-predictor",
+        type=int,
+        default=1,
+        help="1=use heuristic predicted precursor charge to limit matching",
+    )
+    p.add_argument("--min-precursor-z", type=int, default=2)
+    p.add_argument("--max-precursor-z", type=int, default=4)
+    p.add_argument(
+        "--require-frag-z2",
+        type=int,
+        default=1,
+        help="1=require ≥1 predicted fragment with z≥2 (used in conf & the charge rule)",
+    )
+    p.add_argument(
+        "--skip-short-frags",
+        type=int,
+        default=1,
+        help="1=skip b1,b2,y1,y2 in fragment matching & in charge rule",
+    )
+    p.add_argument(
+        "--avoid-post-proline-cleavage",
+        type=int,
+        default=1,
+        help="1=avoid cleavages C-terminal to Proline for fragments & the charge rule",
+    )
+
+    # Rankings / tie-break (global composite simplified)
     p.add_argument(
         "--rank-weights",
-        default="fly:0.25,hydro:0.25,conf_mz:0.15,term:0.10,polymer:0.20,types:0.05",
+        default="hydro:0.3,conf_mz:0.3,hk:0.3,polymer:0.10",
+        help="Weights for global composite (normalized to [0,1]): hydro, conf_mz, hk, polymer",
     )
     p.add_argument("--overall-rule-weight", type=float, default=1.0)
-    p.add_argument("--overall-cont-weight", type=float, default=1.0)
+    p.add_argument("--overall-cont-weight", type=float, default=2.0)
+    p.add_argument(
+        "--perm-combine-weights",
+        default="conf:0.5,hydro:0.5",
+        help="Weights for combining confusability (0–1) and hydrophobic fraction (0–1) among rule-best survivors",
+    )
 
     # Selection
-    p.add_argument("--N", type=int, default=48, help="Number of decoys to select")
-    p.add_argument("--dedup-k", type=int, default=4, help="k-mer de-dup (0 disables)")
-    p.add_argument(
-        "--diversity-bonus",
-        type=float,
-        default=0.10,
-        help="Novelty bonus by category coverage",
-    )
-    p.add_argument(
-        "--improvement-bonus",
-        type=float,
-        default=0.15,
-        help="Bonus for normalized rank improvement",
-    )
+    p.add_argument("--N", type=int, default=10, help="Number of decoys to select")
+    p.add_argument("--dedup-k", type=int, default=5, help="k-mer de-dup (0 disables)")
     p.add_argument(
         "--require-contam-match",
         type=int,
         default=1,
-        help="Require ≥1 contaminant to select",
+        help="Require conf_mz_multi ≥ 0.01 to select",
     )
     p.add_argument(
         "--enforce-hydrophobic-cterm",
@@ -1268,21 +2122,7 @@ def make_parser() -> argparse.ArgumentParser:
         help="Minimum hydrophobic_fraction increase",
     )
 
-    # Percentile stratification (optional summary filters)
-    p.add_argument(
-        "--percentile-cut",
-        type=float,
-        default=25.0,
-        help="Report thresholds used in summaries",
-    )
-    p.add_argument(
-        "--select-metric",
-        choices=["rule", "final"],
-        default="final",
-        help="Which metric to percentile-filter on when reporting",
-    )
-
-    # Housekeeping homology (parity with WIQD)
+    # Housekeeping
     p.add_argument(
         "--housekeeping-fasta",
         default=None,
@@ -1291,14 +2131,20 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--download-housekeeping",
         action="store_true",
-        help="Download housekeeping proteins from UniProt (requires internet)",
+        help="Download housekeeping proteins from UniProt",
     )
-    p.add_argument("--hk-k", type=int, default=4, help="k for housekeeping homology")
     p.add_argument(
-        "--hk-collapse",
+        "--housekeeping-k", type=int, default=4, help="k for housekeeping homology"
+    )
+    p.add_argument(
+        "--housekeeping-collapse",
         choices=["none", "xle", "xle_de_qn", "xle+deqn"],
         default="xle",
-        help="Collapsed alphabet for HK homology",
+    )
+    p.add_argument(
+        "--xle-collapse",
+        action="store_true",
+        help="Collapse I/L→J for HK analysis (k-mer + substring)",
     )
 
     # Viz
@@ -1306,9 +2152,9 @@ def make_parser() -> argparse.ArgumentParser:
         "--dense-threshold",
         type=int,
         default=1500,
-        help="Switch to hexbin when many non-selected",
+        help="Hexbin switch threshold for dense plots",
     )
-    p.add_argument("--trace-label-maxlen", type=int, default=36)
+    p.add_argument("--trace-label-maxlen", type=int, default=48)
 
     # Verbosity
     p.add_argument("--verbose", action="store_true")
@@ -1317,94 +2163,159 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 # =============================================================================
-# Pipeline
+# Mutation parsing (PEPTIDE coords)
 # =============================================================================
-def resolve_mut_idx_column(df: pd.DataFrame, args) -> Tuple[pd.Series, pd.Series]:
-    """
-    Returns (mut_idx0:int series, is_frameshift:boolean series).
 
-    Frameshift rows (mutation notation contains 'fs' case-insensitive) are
-    *exempt* from --require-mut-idx0 and keep mut_idx0 as <NA>.
-    """
-    pepcol = args.peptide_col
-    Ls = df[pepcol].astype(str).map(len)
+_MUT_NOTATION_RE = re.compile(
+    r"(?:(?:p\.)?\s*)?([A-Z*])\s*(\d+)\s*([A-Z*]|fs\*?)", flags=re.IGNORECASE
+)
 
-    def parse_first_int(s: str) -> Optional[int]:
-        if s is None or (isinstance(s, float) and math.isnan(s)):
-            return None
-        m = re.search(r"(\d+)", str(s))
-        return int(m.group(1)) if m else None
 
-    # frameshift mask from mut-notation-col (Gene_AA_Change style)
-    fs_mask = pd.Series(False, index=df.index)
-    if args.mut_notation_col and args.mut_notation_col in df.columns:
-        fs_mask = (
-            df[args.mut_notation_col]
-            .astype(str)
-            .str.contains(r"\bfs\b", case=False, na=False)
-        )
-
-    # Primary: mut-idx-col (already 0-based)
-    if args.mut_idx_col and args.mut_idx_col in df.columns:
-        s = pd.to_numeric(df[args.mut_idx_col], errors="coerce").astype("Int64")
-        mut0 = s.copy()
+def _convert_pos_to_idx0(pos_val: int, indexing: str, L: int) -> Optional[int]:
+    if pos_val is None:
+        return None
+    try:
+        v = int(pos_val)
+    except Exception:
+        return None
+    if indexing == "0":
+        idx0 = v
+    elif indexing == "1":
+        idx0 = v - 1
+    elif indexing == "C1":
+        idx0 = L - v
     else:
-        mut0 = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int64")
+        idx0 = None
+    if idx0 is None or idx0 < 0 or idx0 >= L:
+        return None
+    return idx0
 
-    # pos-col + indexing
-    if mut0.isna().any() and args.pos_col and args.pos_col in df.columns:
-        pos = pd.to_numeric(df[args.pos_col], errors="coerce").astype("Int64")
-        if args.indexing in ("1", "C1"):
-            pos = pos - 1
-        mut0 = mut0.fillna(pos)
 
-    # mut-notation-col
-    if (
-        mut0.isna().any()
-        and args.mut_notation_col
-        and args.mut_notation_col in df.columns
-    ):
-        extra = df[args.mut_notation_col].apply(parse_first_int).astype("Int64")
-        if args.indexing in ("1", "C1"):
-            extra = extra - 1
-        mut0 = mut0.fillna(extra)
+def _parse_mut_notation_peptide(
+    seq: str, notation: str, indexing: str
+) -> Tuple[Optional[int], Optional[str], Optional[str], bool]:
+    assert notation
+    assert len(notation) > 0
+    assert indexing in ("0", "1", "C1")
 
-    # Enforce for non-frameshift only
-    missing_mask = mut0.isna() & (~fs_mask)
+    s = str(notation).strip().lower()
+    is_protein_target = (s == "taa") or (s == "cta")
+    is_fusion = s == "fusion"
+    is_fs = bool(re.search(r"(_fs| fs|\d+fs)$", s, flags=re.IGNORECASE))
+    modify_any_residue = is_fs or is_protein_target or is_fusion
+    m = _MUT_NOTATION_RE.search(s)
+    if not m:
+        return None, None, None, modify_any_residue
+    wt = m.group(1).upper()
+    pos = int(m.group(2))
+    mut = m.group(3).upper()
+    if mut.startswith("FS"):
+        return None, wt, None, True
+    L = len(seq)
+    idx0 = _convert_pos_to_idx0(pos, indexing, L)
+    if idx0 is None or idx0 < 0 or idx0 >= L:
+        return None, None, None, modify_any_residue
+    if wt != seq[idx0]:
+        return None, None, None, modify_any_residue
+    return idx0, wt, mut, False
+
+
+def _coerce_is_hit_col(s: pd.Series) -> pd.Series:
+    def f(v):
+        if isinstance(v, (int, float)) and not pd.isna(v):
+            return bool(int(v))
+        if isinstance(v, str):
+            vv = v.strip().lower()
+            return vv in ("1", "true", "t", "y", "yes", "hit")
+        return False
+
+    return s.map(f)
+
+
+def resolve_mut_idx_column(
+    df: pd.DataFrame,
+    peptide_col: str,
+    is_hit_col: str,
+    mut_idx_col: str,
+    pos_col: str,
+    mut_notation_col: str,
+    indexing: str,
+    require_mut_idx0: bool,
+    outdir: str,
+) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+
+    Ls = df[peptide_col].astype(str).map(len)
+
+    mut0 = pd.Series([pd.NA] * len(df), index=df.index, dtype="Int64")
+    is_fs_series = pd.Series(False, index=df.index, dtype=bool)
+    wt_series = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    mut_series = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    is_hit_series = pd.Series([False] * len(df), index=df.index, dtype=bool)
+
+    if is_hit_col and is_hit_col in df.columns:
+        is_hit_series = _coerce_is_hit_col(df[is_hit_col])
+
+    if mut_idx_col and mut_idx_col in df.columns:
+        s = pd.to_numeric(df[mut_idx_col], errors="coerce").astype("Int64")
+        mut0 = s.copy()
+
+    if mut0.isna().any() and pos_col and pos_col in df.columns:
+        pos_raw = pd.to_numeric(df[pos_col], errors="coerce").astype("Int64")
+        pos_idx0 = []
+        for i, pos in enumerate(pos_raw.tolist()):
+            L = int(Ls.iloc[i])
+            idx = None if pd.isna(pos) else _convert_pos_to_idx0(int(pos), indexing, L)
+            pos_idx0.append(idx if idx is not None else pd.NA)
+        pos_idx0 = pd.Series(pos_idx0, index=df.index, dtype="Int64")
+        mut0 = mut0.fillna(pos_idx0)
+
+    if mut_notation_col and mut_notation_col in df.columns:
+        idx_list, wt_list, mut_list, fs_list = [], [], [], []
+        for i in range(len(df)):
+            seq = str(df.iloc[i][peptide_col])
+            note = str(df.iloc[i][mut_notation_col])
+            idx0, wt, mut, is_fs = _parse_mut_notation_peptide(seq, note, indexing)
+            idx_list.append(idx0 if idx0 is not None else pd.NA)
+            wt_list.append(wt if wt is not None else pd.NA)
+            mut_list.append(mut if mut is not None else pd.NA)
+            fs_list.append(bool(is_fs))
+        idx_series = pd.Series(idx_list, index=df.index, dtype="Int64")
+        wt_series = pd.Series(wt_list, index=df.index, dtype="object")
+        mut_series = pd.Series(mut_list, index=df.index, dtype="object")
+        is_fs_series = is_fs_series | pd.Series(fs_list, index=df.index, dtype=bool)
+
+        mut0 = mut0.fillna(idx_series)
+
+    missing_mask = mut0.isna() & (~is_fs_series)
     if missing_mask.any():
-        if args.require_mut_idx0:
+        if require_mut_idx0:
             bad = df.loc[
                 missing_mask,
-                [pepcol]
-                + [
-                    c
-                    for c in [args.mut_idx_col, args.pos_col, args.mut_notation_col]
-                    if c
-                ],
+                [peptide_col]
+                + [c for c in [mut_idx_col, pos_col, mut_notation_col] if c],
             ]
-            path = os.path.join(args.outdir, "missing_mut_idx0_rows.csv")
-            ensure_outdir(args.outdir)
+            path = os.path.join(outdir, "missing_mut_idx0_rows.csv")
+            ensure_outdir(outdir)
             bad.to_csv(path, index=False)
             raise ValueError(
                 f"[mut_idx0] Required but missing/invalid for {int(missing_mask.sum())} non-frameshift rows. See {path}."
             )
-        # auto-place near middle (avoid terminals)
         auto = (
-            df[pepcol].astype(str).map(lambda s: max(1, min(len(s) - 2, len(s) // 2)))
+            df[peptide_col]
+            .astype(str)
+            .map(lambda s: max(1, min(len(s) - 2, len(s) // 2)))
         )
         mut0 = mut0.fillna(auto).astype("Int64")
 
-    # Range check only for non-frameshifts
     out = []
     errors = []
     for i, (idx0, L, is_fs) in enumerate(
-        zip(mut0.tolist(), Ls.tolist(), fs_mask.tolist())
+        zip(mut0.tolist(), Ls.tolist(), is_fs_series.tolist())
     ):
         if is_fs:
-            out.append(pd.NA)  # keep NA for fs rows
+            out.append(pd.NA)
             continue
         if idx0 is None or (isinstance(idx0, float) and math.isnan(idx0)):
-            errors.append((i, "NaN"))
             out.append(pd.NA)
             continue
         v = int(idx0)
@@ -1412,13 +2323,106 @@ def resolve_mut_idx_column(df: pd.DataFrame, args) -> Tuple[pd.Series, pd.Series
             errors.append((i, f"out_of_range({v})_len({L})"))
         out.append(v)
     if errors:
-        path = os.path.join(args.outdir, "invalid_mut_idx0_rows.csv")
-        ensure_outdir(args.outdir)
+        path = os.path.join(outdir, "invalid_mut_idx0_rows.csv")
+        ensure_outdir(outdir)
         pd.DataFrame(
-            [{"row": i, "reason": r, "peptide": df.iloc[i][pepcol]} for i, r in errors]
+            [
+                {"row": i, "reason": r, "peptide": df.iloc[i][peptide_col]}
+                for i, r in errors
+            ]
         ).to_csv(path, index=False)
         raise ValueError(f"[mut_idx0] Found {len(errors)} invalid indices; see {path}")
-    return pd.Series(out, index=df.index, dtype="Int64"), fs_mask.astype(bool)
+    return (
+        pd.Series(out, index=df.index, dtype="Int64"),
+        is_fs_series.astype(bool),
+        wt_series,
+        mut_series,
+        is_hit_series,
+    )
+
+
+# =============================================================================
+# Pipeline
+# =============================================================================
+
+
+def _global_tie(hn, cn, hkn, pn, weights):
+    # all inputs are normalized to [0,1]
+    return (
+        weights.get("hydro", 0.0) * hn
+        + weights.get("conf_mz", 0.0) * cn
+        + weights.get("hk", 0.0) * hkn
+        + weights.get("polymer", 0.0) * pn
+    )
+
+
+def _compress_path_for_display(
+    state: PathState, xvals: List[float], yvals: List[float]
+) -> Tuple[List[str], List[str], List[str], List[float], List[float]]:
+    """
+    Keep only nodes where an edit occurred (drop '...:keep' steps), always keep origin.
+    Returns: (edge_labels, stage_names, stage_seqs, xvals, yvals)
+    """
+    kept_idx = [0]
+    for i in range(1, len(state.stage_names)):
+        if i - 1 < len(state.labels) and not str(state.labels[i - 1]).endswith("keep"):
+            kept_idx.append(i)
+    stage_names2 = [state.stage_names[i] for i in kept_idx]
+    stage_seqs2 = [state.stage_seqs[i] for i in kept_idx]
+    xvals2 = [xvals[i] for i in kept_idx]
+    yvals2 = [yvals[i] for i in kept_idx]
+    edge_labels2 = [state.labels[i - 1] for i in kept_idx[1:]]
+    return edge_labels2, stage_names2, stage_seqs2, xvals2, yvals2
+
+
+def load_csv(
+    input_csv: str,
+    peptide_col: str,
+    is_hit_col: str,
+    mut_idx_col: str,
+    pos_col: str,
+    mut_notation_col: str,
+    indexing: str,
+    require_mut_idx0: bool,
+    outdir: str,
+) -> pd.DataFrame:
+    df_in = pd.read_csv(input_csv)
+
+    pepcols = peptide_col.split(",")
+    for peptide_col in pepcols:
+        if peptide_col in df_in.columns:
+            break
+    else:
+        raise ValueError(f"[load_csv] No peptide column found among: {pepcols}")
+
+    pos_cols = pos_col.split(",") if pos_col else []
+
+    for pos_col in pos_cols:
+        if pos_col in df_in.columns:
+            break
+    else:
+        raise ValueError(f"[load_csv] No pos_col found among: {pos_cols}")
+
+    df = df_in.copy()
+    df[peptide_col] = df[peptide_col].map(clean_seq)
+    df = df[df[peptide_col].str.len() > 0].copy()
+    LOG.info(f"Loaded {len(df)} rows from {input_csv} with valid peptides.")
+
+    # Mut idx / frameshift / WT/MUT letters (peptide coordinates) + is_hit
+    df["mut_idx0"], df["is_frameshift"], df["wt_aa"], df["mut_aa"], df["is_hit"] = (
+        resolve_mut_idx_column(
+            df,
+            peptide_col=peptide_col,
+            is_hit_col=is_hit_col,
+            mut_idx_col=mut_idx_col,
+            pos_col=pos_col,
+            mut_notation_col=mut_notation_col,
+            indexing=indexing,
+            require_mut_idx0=require_mut_idx0,
+            outdir=outdir,
+        )
+    )
+    return df, peptide_col, pos_col
 
 
 def main():
@@ -1426,24 +2430,20 @@ def main():
     if args.verbose:
         LOG.setLevel(logging.DEBUG)
     ensure_outdir(args.outdir)
-    ensure_outdir(os.path.join(args.outdir, "plots"))
     ensure_outdir(os.path.join(args.outdir, "plots", "edit_paths"))
-    ensure_outdir(os.path.join(args.outdir, "plots", "seq_traces_selected"))
-    ensure_outdir(os.path.join(args.outdir, "plots", "seq_traces_not_selected"))
 
     # Load input
-    df_in = pd.read_csv(args.input_csv)
-    if args.peptide_col not in df_in.columns:
-        raise ValueError(
-            f"Missing peptide column '{args.peptide_col}'. Available: {list(df_in.columns)[:12]}..."
-        )
-    df = df_in.copy()
-    df[args.peptide_col] = df[args.peptide_col].map(clean_seq)
-    df = df[df[args.peptide_col].str.len() > 0].copy()
-    LOG.info(f"Loaded {len(df)} rows with valid peptides.")
-
-    # Solve mut_idx0 (+ frameshift flag)
-    df["mut_idx0"], df["is_frameshift"] = resolve_mut_idx_column(df, args)
+    df, peptide_col, pos_col = load_csv(
+        args.input_csv,
+        args.peptide_col,
+        args.is_hit_col,
+        args.mut_idx_col,
+        args.pos_col,
+        args.mut_notation_col,
+        args.indexing,
+        args.require_mut_idx0,
+        args.outdir,
+    )
 
     # Sets & windows
     set_names = [s.strip() for s in str(args.sets).split(",") if s.strip()]
@@ -1451,8 +2451,21 @@ def main():
         set_names, args.sets_fasta_dir, bool(args.download_sets), args.download_timeout
     )
 
-    charges_prec = sorted({int(z) for z in parse_csv_list(args.charges, int)})
-    frag_charges = sorted({int(z) for z in parse_csv_list(args.frag_charges, int)})
+    charges_prec_fallback = sorted({int(z) for z in parse_csv_list(args.charges, int)})
+    frag_charges_fallback = sorted(
+        {int(z) for z in parse_csv_list(args.frag_charges, int)}
+    )
+
+    # All confusability options are passed explicitly (never as function attributes)
+    conf_kwargs = dict(
+        use_charge_pred=bool(args.use_charge_predictor),
+        max_pred_z=int(args.max_precursor_z),
+        skip_short_frags=bool(args.skip_short_frags),
+        avoid_post_proline=bool(args.avoid_post_proline_cleavage),
+        require_frag_z2=bool(args.require_frag_z2),
+        frag_charges=frag_charges_fallback,
+    )
+
     cys_fixed = 57.021464 if args.cys_mod == "carbamidomethyl" else 0.0
 
     windows_by_set: Dict[str, List[Window]] = {}
@@ -1463,33 +2476,42 @@ def main():
             acc2seq_by_set[s],
             args.full_mz_len_min,
             args.full_mz_len_max,
-            charges_prec,
+            charges_prec_fallback,
             args.gradient_min,
             cys_fixed,
         )
         index_fragments_for_windows(
-            wins, args.fragment_kmin, args.fragment_kmax, frag_charges, cys_fixed
+            wins,
+            args.fragment_kmin,
+            args.fragment_kmax,
+            frag_charges_fallback,
+            cys_fixed,
         )
         windows_by_set[s] = wins
         LOG.info(f"[windows] {s}: {len(wins)} windows indexed")
 
-    # Housekeeping bank (parity with WIQD)
+    # Housekeeping bank + substring banks
     hk_bank: Set[str] = set()
+    hk_sub_banks: Dict[int, Set[str]] = {}
+    hk_collapse_mode = "xle" if args.xle_collapse else str(args.housekeeping_collapse)
     if args.housekeeping_fasta or args.download_housekeeping:
         hk_seqs = load_housekeeping_sequences(
             args.housekeeping_fasta, args.download_housekeeping
         )
         if hk_seqs:
             hk_bank = build_hk_kmer_bank(
-                hk_seqs, k=int(args.hk_k), collapse=str(args.hk_collapse)
+                hk_seqs, k=int(args.housekeeping_k), collapse=hk_collapse_mode
+            )
+            hk_sub_banks = build_hk_substring_banks(
+                hk_seqs, collapse=hk_collapse_mode, Lmax=20
             )
             LOG.info(
-                f"[housekeeping] bank size={len(hk_bank)} (k={args.hk_k}, collapse={args.hk_collapse})"
+                f"[housekeeping] bank size={len(hk_bank)} (k={args.housekeeping_k}, collapse={hk_collapse_mode}); substring banks up to L=20."
             )
         else:
-            LOG.info("[housekeeping] no sequences found; HK metric disabled")
+            LOG.info("[housekeeping] no sequences found; HK disabled")
     else:
-        LOG.info("[housekeeping] skipped (no FASTA and no download flag)")
+        LOG.info("[housekeeping] skipped (no FASTA / no download)")
 
     # PEG-like candidates
     polymer_cands = enumerate_polymer_series(
@@ -1502,7 +2524,7 @@ def main():
         adducts=tuple(
             x.strip() for x in str(args.polymer_adducts).split(",") if x.strip()
         ),
-        zset=tuple(int(z) for z in str(args.polymer_z).split(",") if z.strip()),
+        zset=tuple(int(z.strip()) for z in str(args.polymer_z).split(",") if z.strip()),
         n_min=int(args.polymer_n_min),
         n_max=int(args.polymer_n_max),
         mz_min=float(args.polymer_mz_min),
@@ -1510,53 +2532,51 @@ def main():
     )
     LOG.info(f"[polymer] candidates: {len(polymer_cands)}")
 
-    # Rule/Edit params
+    # Rule/Edit params & weights
     rp = RuleParams(
         nterm_good=tuple(args.nterm_good),
         nterm_bad_strong=tuple(args.nterm_bad_strong),
         nterm_bad_weak=tuple(args.nterm_bad_weak),
         nterm_targets=tuple(args.nterm_targets),
         bad_internal=tuple(args.bad_internal),
-        hydrophobic_cterm_set=tuple("FILVWYM"),
-        rule_flank_gap_min=int(args.rule_flank_gap_min),
-        xle_collapse=bool(args.xle_collapse),
+        hydro_internal_min=int(args.hydro_internal_min),
+        hydro_internal_bonus=float(args.hydro_internal_bonus),
+        cm_split_bonus=float(args.cm_split_bonus),
+        min_precursor_z=int(args.min_precursor_z),
+        max_precursor_z=int(args.max_precursor_z),
+        skip_short_frags_rule=bool(args.skip_short_frags),
+        avoid_post_pro_rule=bool(args.avoid_post_proline_cleavage),
     )
-    ep = EditParams(
-        nterm_targets=tuple(args.nterm_targets),
-        hydrophobic_cterm_set=tuple("FILVWYM"),
-        rule_flank_gap_min=int(args.rule_flank_gap_min),
-        xle_collapse=bool(args.xle_collapse),
-    )
-    weights = parse_weight_map(args.rank_weights)
+    ep = EditParams(nterm_targets=tuple(args.nterm_targets))
+    weights_global = parse_weight_map(args.rank_weights)
+    weights_perm = parse_weight_map(args.perm_combine_weights)
+    w_conf = float(weights_perm.get("conf", 0.5))
+    w_hyd = float(weights_perm.get("hydro", 0.5))
 
     # -------------------- Score originals + fit transforms --------------------
-    LOG.info("Scoring originals (rule + continuous + HK homology) …")
+    LOG.info(
+        "Scoring originals (global composite: normalized hydro + conf + HK + optional polymer) …"
+    )
     rows = []
-    pbar = tqdm(range(len(df)), disable=bool(args.no_progress), desc="Originals")
-    for i in pbar:
-        seq = df.iloc[i][args.peptide_col]
-        mut_idx0_val = df.iloc[i]["mut_idx0"]
-        mut_idx0 = None if pd.isna(mut_idx0_val) else int(mut_idx0_val)
-        r = rule_score(seq, rp)
 
+    for seq in tqdm(df[peptide_col], disable=bool(args.no_progress), desc="Originals"):
+
+        r = rule_score(seq, rp)
         hydro_raw = kd_gravy(seq)
         fly = fly_surface_norm(seq)
-        # Multi-set confusability
         rt_pred = predict_rt_min(seq, args.gradient_min)
+
         conf_per_set = {}
-        bestppm_per_set = {}
         for s in set_names:
             wins = windows_by_set[s]
-            if not wins:
-                conf_per_set[s] = 0.0
-                bestppm_per_set[s] = float("inf")
-                continue
-            d = confusability_script1(
+            assert len(wins) > 0, f"No windows for set '{s}'"
+
+            d = confusability_in_mz(
                 seq,
                 wins,
                 args.full_mz_len_min,
                 args.full_mz_len_max,
-                charges_prec,
+                charges_prec_fallback,
                 args.ppm_tol,
                 rt_pred,
                 args.rt_tolerance_min,
@@ -1565,28 +2585,21 @@ def main():
                 args.fragment_kmax,
                 good_ppm=args.good_ppm_strict,
                 frag_types_req=args.frag_types_req,
-                frag_charges=frag_charges,
+                **conf_kwargs,
             )
             conf_per_set[s] = d["score"]
-            bestppm_per_set[s] = d["best_ppm"]
         conf_mz_multi = max(conf_per_set.values()) if conf_per_set else 0.0
 
-        # HK homology (WIQD parity)
         hk = hk_kmer_features(
-            seq, hk_bank, k=int(args.hk_k), collapse=str(args.hk_collapse)
+            seq, hk_bank, k=int(args.housekeeping_k), collapse=hk_collapse_mode
         )
-
-        # PEG
         polymer = polymer_best_for_peptide(
             seq,
             polymer_cands,
-            peptide_z=tuple(charges_prec),
+            peptide_z=tuple(charges_prec_fallback),
             ppm_window=args.polymer_ppm_strict,
             cys_fixed_mod=cys_fixed,
         )
-
-        # Diversity
-        aa_types = aa_type_metric(seq)
 
         rows.append(
             {
@@ -1603,48 +2616,38 @@ def main():
                     "polymer_best_abs_ppm", float("inf")
                 ),
                 "polymer_details": polymer.get("polymer_details", ""),
-                "aa_types": aa_types,
             }
         )
     base = pd.DataFrame(rows)
 
-    # Robust transforms (fit on originals)
+    # Robust transforms (0..1)
     t_hydro = RobustMinMax(base["kd_gravy"])
     t_conf = RobustMinMax(base["conf_mz_multi"])
     t_hk = RobustMinMax(base["hk_kmer_frac"])
-    t_types = RobustMinMax(base["aa_types"])
+    t_poly = RobustMinMax(base["polymer_conf"])
 
     base["hydro_norm"] = t_hydro.transform(base["kd_gravy"])
     base["confusability_norm"] = t_conf.transform(base["conf_mz_multi"])
     base["hk_kmer_norm"] = t_hk.transform(base["hk_kmer_frac"])
-    base["aa_types_norm"] = t_types.transform(base["aa_types"])
+    base["polymer_norm"] = t_poly.transform(base["polymer_conf"])
 
-    # Tie-breaker and final composite
     base["tie_break_score"] = [
-        combine_tie_breaker(
-            weights=weights,
-            hydro_norm=hn,
-            conf_norm=cn,
-            hk_norm=hkn,
-            polymer_weight=0.0,  # polymer is re-evaluated per candidate decoy; keep 0 for originals
-            aa_types_norm=an,
-        )
-        for hn, cn, hkn, an in zip(
+        _global_tie(hn, cn, hkn, pn, weights_global)
+        for hn, cn, hkn, pn in zip(
             base["hydro_norm"],
             base["confusability_norm"],
             base["hk_kmer_norm"],
-            base["aa_types_norm"],
+            base["polymer_norm"],
         )
     ]
     base["final_rank_score"] = (
-        args.overall_rule_weight * base["rule_total"]
-        + args.overall_cont_weight * base["tie_break_score"]
+        float(args.overall_rule_weight) * base["rule_total"]
+        + float(args.overall_cont_weight) * base["tie_break_score"]
     )
 
     out_all = pd.concat(
         [df.reset_index(drop=True), base.reset_index(drop=True)], axis=1
     )
-    # Safety: drop duplicated columns if any (keep leftmost)
     if out_all.columns.duplicated().any():
         out_all = out_all.loc[:, ~out_all.columns.duplicated()]
 
@@ -1652,9 +2655,9 @@ def main():
     out_all.to_csv(all_csv, index=False)
     LOG.info(f"Wrote: {all_csv} (n={len(out_all)})")
 
-    # Tie-scorer used during edits (fast; uses fit transforms)
-    def tie_scorer_for_seq(s: str) -> float:
-        h = t_hydro.transform_scalar(kd_gravy(s))
+    # -------------------- Helper caches for conf/hydro ------------------------
+    @lru_cache(maxsize=200000)
+    def conf_score_cached(s: str) -> float:
         rt_pred = predict_rt_min(s, args.gradient_min)
         confs = []
         for _set in set_names:
@@ -1662,12 +2665,12 @@ def main():
             if not wins:
                 confs.append(0.0)
                 continue
-            d = confusability_script1(
+            d = confusability_in_mz(
                 s,
                 wins,
                 args.full_mz_len_min,
                 args.full_mz_len_max,
-                charges_prec,
+                charges_prec_fallback,
                 args.ppm_tol,
                 rt_pred,
                 args.rt_tolerance_min,
@@ -1676,49 +2679,194 @@ def main():
                 args.fragment_kmax,
                 good_ppm=args.good_ppm_strict,
                 frag_types_req=args.frag_types_req,
-                frag_charges=frag_charges,
+                **conf_kwargs,
             )
             confs.append(d["score"])
-        c = t_conf.transform_scalar(max(confs) if confs else 0.0)
-        hkf = hk_kmer_features(
-            s, hk_bank, k=int(args.hk_k), collapse=str(args.hk_collapse)
-        )
-        hk_norm = t_hk.transform_scalar(hkf["hk_kmer_frac"])
-        fly = math.sqrt(h * h + c * c)
-        return (
-            weights.get("fly", 0.0) * fly
-            + weights.get("hydro", 0.0) * h
-            + weights.get("conf_mz", 0.0) * c
-            + weights.get("term", 0.0) * hk_norm
-        )
+        return max(confs) if confs else 0.0
 
-    # -------------------- Make a decoy for EVERY peptide ---------------------
-    LOG.info(
-        "Synthesizing one decoy per peptide via edit path: Nterm → C → P → M → Cterm …"
-    )
+    @lru_cache(maxsize=200000)
+    def hydro_frac_cached(s: str) -> float:
+        return hydrophobic_fraction(s)
+
+    # -------------------- RULE-FIRST decoy per peptide ------------------------
+    LOG.info("Synthesizing one best decoy per peptide (RULE-FIRST permutations) …")
     dec_rows = []
     pbar2 = tqdm(
         range(len(out_all)), disable=bool(args.no_progress), desc="Decoys(all)"
     )
     for i in pbar2:
         seq = out_all.loc[i, "seq"]
-        # frameshift flag
         is_fs = (
             bool(out_all.loc[i, "is_frameshift"])
             if "is_frameshift" in out_all.columns
             else False
         )
-        # mut index (None for frameshift or NA)
-        raw_mut = out_all.loc[i, "mut_idx0"] if "mut_idx0" in out_all.columns else pd.NA
-        mut_idx0 = None if (pd.isna(raw_mut) or is_fs) else int(raw_mut)
 
-        stage_seqs, labels = build_edit_path(
-            seq, mut_idx0, rp, ep, tie_scorer=tie_scorer_for_seq, is_frameshift=is_fs
+        starts = enumerate_terminals_by_rule(
+            seq,
+            rp,
+            ep,
+            mut_idx0=(
+                None
+                if pd.isna(out_all.loc[i, "mut_idx0"])
+                else int(out_all.loc[i, "mut_idx0"])
+            ),
+            wt_aa=(
+                None
+                if pd.isna(out_all.loc[i, "wt_aa"])
+                else str(out_all.loc[i, "wt_aa"])
+            ),
+            mut_aa=(
+                None
+                if pd.isna(out_all.loc[i, "mut_aa"])
+                else str(out_all.loc[i, "mut_aa"])
+            ),
+            is_fs=is_fs,
+            term_beam=int(args.term_beam),
         )
-        s0, sN, sC, sP, sM, sT = stage_seqs
-        final = sT
 
-        # Original vs final: recompute components
+        # permutations of internal stages (P, C, M, RK), beam-pruned after each stage
+        STAGE_ORDERS = list(permutations(("P", "C", "M", "RK"), 4))
+        global_best_rule = -1e99
+        global_states: Dict[str, List[PathState]] = {}
+        for permutation in STAGE_ORDERS:
+            frontier: List[PathState] = starts[:]
+            for stage in permutation:
+                new_frontier: List[PathState] = []
+                for st in frontier:
+                    new_frontier.extend(expand_stage(st, stage, rp, args))
+                # group by sequence and keep canonical path per sequence
+                seen: Dict[str, Tuple[Tuple[float, int, str], PathState]] = {}
+                for st in new_frontier:
+                    r = rule_score(st.seq, rp)["rule_total"]
+                    tokstr = ";".join([t for t in st.tokens if t])
+                    key = st.seq
+                    val = (
+                        r,
+                        -len(st.tokens),
+                        tokstr,
+                    )  # pref: higher rule, fewer edits, lexicographically earlier token string
+                    if (key not in seen) or (val > seen[key][0]):
+                        seen[key] = (val, st)
+                cand = [(v[0][0], v[1]) for v in seen.values()]  # (rule_total, state)
+                cand.sort(key=lambda t: t[0], reverse=True)
+                frontier = [st for (_, st) in cand[: max(1, int(args.beam_internal))]]
+
+            scores = [(st, rule_score(st.seq, rp)["rule_total"]) for st in frontier]
+            if not scores:
+                continue
+            perm_best = max(v for _, v in scores)
+            winners = [st for (st, v) in scores if v == perm_best]
+            if perm_best > global_best_rule:
+                global_best_rule = perm_best
+                global_states = {}
+            if perm_best == global_best_rule:
+                for st in winners:
+                    global_states.setdefault(st.seq, []).append(st)
+
+        # If nothing changed, force a single M substitution (best position)
+        if (
+            (len(global_states) == 1)
+            and (seq in global_states)
+            and all(len(st.tokens) == 0 for st in global_states[seq])
+        ):
+            bestM = None
+            bestM_rule = -1e99
+            for pos in range(0, len(seq)):
+                if seq[pos] in PROTECTED_SET or seq[pos] == "M":
+                    continue
+                s2 = seq[:pos] + "M" + seq[pos + 1 :]
+                r = rule_score(s2, rp)["rule_total"]
+                if r > bestM_rule:
+                    bestM_rule, bestM = r, PathState(
+                        seq=s2,
+                        stage_names=["orig", "M"],
+                        stage_seqs=[seq, s2],
+                        labels=["M@%d" % (pos + 1)],
+                        tokens=["M%d" % (pos + 1)],
+                        mut_idx0=(
+                            None
+                            if pd.isna(out_all.loc[i, "mut_idx0"])
+                            else int(out_all.loc[i, "mut_idx0"])
+                        ),
+                        is_frameshift=is_fs,
+                        wt_aa=(
+                            None
+                            if pd.isna(out_all.loc[i, "wt_aa"])
+                            else str(out_all.loc[i, "wt_aa"])
+                        ),
+                        mut_aa=(
+                            None
+                            if pd.isna(out_all.loc[i, "mut_aa"])
+                            else str(out_all.loc[i, "mut_aa"])
+                        ),
+                        did_internal_edit=True,
+                    )
+            if bestM is not None:
+                global_best_rule = bestM_rule
+                global_states = {bestM.seq: [bestM]}
+
+        # canonical path per unique sequence
+        seq_to_best_state: Dict[str, PathState] = {}
+        for candidate_seq, states in global_states.items():
+            states2 = []
+            for st in states:
+                tokstr = ";".join([t for t in st.tokens if t])
+                states2.append((len(st.tokens), tokstr, st))
+            states2.sort(key=lambda t: (t[0], t[1]))
+            seq_to_best_state[candidate_seq] = states2[0][2]
+
+        # Continuous among rule-best: conf (0–1) and hydro fraction (0–1)
+        scored: List[Tuple[float, float, float, int, int, str, PathState]] = []
+        for candidate_seq, st in seq_to_best_state.items():
+            conf = conf_score_cached(candidate_seq)
+            hyd = hydro_frac_cached(candidate_seq)
+            comb = w_conf * conf + w_hyd * hyd
+            hk_long = (
+                hk_longest_substring_len(
+                    candidate_seq,
+                    hk_sub_banks,
+                    collapse=(
+                        "xle" if args.xle_collapse else args.housekeeping_collapse
+                    ),
+                )
+                if hk_sub_banks
+                else 0
+            )
+            acid_cnt = sum(ch in ("D", "E") for ch in candidate_seq)
+            scored.append((comb, conf, hyd, hk_long, acid_cnt, candidate_seq, st))
+        if not scored:
+            final_seq = seq
+            final_state = PathState(
+                seq,
+                ["orig"],
+                [seq],
+                [],
+                [],
+                mut_idx0=(
+                    None
+                    if pd.isna(out_all.loc[i, "mut_idx0"])
+                    else int(out_all.loc[i, "mut_idx0"])
+                ),
+                is_frameshift=is_fs,
+                wt_aa=(
+                    None
+                    if pd.isna(out_all.loc[i, "wt_aa"])
+                    else str(out_all.loc[i, "wt_aa"])
+                ),
+                mut_aa=(
+                    None
+                    if pd.isna(out_all.loc[i, "mut_aa"])
+                    else str(out_all.loc[i, "mut_aa"])
+                ),
+            )
+        else:
+            # comb ↓, hyd ↓, HK ↓, acids ↑, lexicographic ↑
+            scored.sort(key=lambda t: (-t[0], -t[2], -t[3], t[4], t[5]))
+            final_seq = scored[0][5]
+            final_state = scored[0][6]
+
+        # 5) Evaluate endpoints for CSV/plots
         def _eval(s: str) -> Dict[str, float]:
             rt_pred = predict_rt_min(s, args.gradient_min)
             confs = []
@@ -1727,32 +2875,39 @@ def main():
                 if not wins:
                     confs.append(0.0)
                     continue
-                d = confusability_script1(
+                d = confusability_in_mz(
                     s,
                     wins,
                     args.full_mz_len_min,
                     args.full_mz_len_max,
-                    charges_prec,
-                    args.ppm_tol,
+                    charges_prec_fallback,
+                    (
+                        args.ppm_tolerance
+                        if hasattr(args, "ppm_tolerance")
+                        else args.ppm_tol
+                    ),
                     rt_pred,
                     args.rt_tolerance_min,
                     cys_fixed,
                     args.fragment_kmin,
                     args.fragment_kmax,
-                    args.good_ppm_strict,
-                    args.frag_types_req,
-                    frag_charges,
+                    good_ppm=args.good_ppm_strict,
+                    frag_types_req=args.frag_types_req,
+                    **conf_kwargs,
                 )
                 confs.append(d["score"])
             polymer = polymer_best_for_peptide(
                 s,
                 polymer_cands,
-                peptide_z=tuple(charges_prec),
+                peptide_z=tuple(charges_prec_fallback),
                 ppm_window=args.polymer_ppm_strict,
                 cys_fixed_mod=cys_fixed,
             )
             hk = hk_kmer_features(
-                s, hk_bank, k=int(args.hk_k), collapse=str(args.hk_collapse)
+                s,
+                hk_bank,
+                k=int(args.housekeeping_k),
+                collapse=("xle" if args.xle_collapse else args.housekeeping_collapse),
             )
             return {
                 "fly": fly_surface_norm(s),
@@ -1766,32 +2921,69 @@ def main():
                 ),
             }
 
+        s0 = seq
+        sF = final_seq
         e0 = _eval(s0)
-        e1 = _eval(sN)
-        e2 = _eval(sC)
-        e3 = _eval(sP)
-        e4 = _eval(sM)
-        e5 = _eval(sT)
-
+        eF = _eval(sF)
         r_old = rule_score(s0, rp)
-        r_new = rule_score(final, rp)
+        r_new = rule_score(sF, rp)
 
-        # Normalize with original-fit scalers where applicable (for tie metrics)
+        # stage path values for plots (x=fly, y=conf)
+        xvals_full = [fly_surface_norm(s) for s in final_state.stage_seqs]
+        yvals_full = []
+        for s in final_state.stage_seqs:
+            rt_pred = predict_rt_min(s, args.gradient_min)
+            confs = []
+            for _set in set_names:
+                wins = windows_by_set[_set]
+                if not wins:
+                    confs.append(0.0)
+                    continue
+                d = confusability_in_mz(
+                    s,
+                    wins,
+                    args.full_mz_len_min,
+                    args.full_mz_len_max,
+                    charges_prec_fallback,
+                    args.ppm_tol,
+                    rt_pred,
+                    args.rt_tolerance_min,
+                    cys_fixed,
+                    args.fragment_kmin,
+                    args.fragment_kmax,
+                    good_ppm=args.good_ppm_strict,
+                    frag_types_req=args.frag_types_req,
+                    **conf_kwargs,
+                )
+                confs.append(d["score"])
+            yvals_full.append(max(confs) if confs else 0.0)
+
+        # Compress the path to only actual edits (drop :keep steps); this fixes "final node is RK" confusion
+        edge_labels_disp, stage_names_disp, stage_seqs_disp, xvals_disp, yvals_disp = (
+            _compress_path_for_display(final_state, xvals_full, yvals_full)
+        )
+
+        # Units-correct metrics for original & final
+        origm = internal_basic_h_sulfur_metrics(s0)
+        finalm = internal_basic_h_sulfur_metrics(sF)
+
+        # Global composite (normalized)
         hydro_old_n = t_hydro.transform_scalar(kd_gravy(s0))
-        hydro_new_n = t_hydro.transform_scalar(kd_gravy(final))
+        hydro_new_n = t_hydro.transform_scalar(kd_gravy(sF))
         conf_old_n = t_conf.transform_scalar(e0["conf"])
-        conf_new_n = t_conf.transform_scalar(e5["conf"])
+        conf_new_n = t_conf.transform_scalar(eF["conf"])
         hk_old_n = t_hk.transform_scalar(e0["hk_frac"])
-        hk_new_n = t_hk.transform_scalar(e5["hk_frac"])
-        types_old_n = t_types.transform_scalar(aa_type_metric(s0))
-        types_new_n = t_types.transform_scalar(aa_type_metric(final))
+        hk_new_n = t_hk.transform_scalar(eF["hk_frac"])
+        poly_old_n = t_poly.transform_scalar(e0["polymer_conf"])
+        poly_new_n = t_poly.transform_scalar(eF["polymer_conf"])
 
-        tie_old = combine_tie_breaker(
-            weights, hydro_old_n, conf_old_n, hk_old_n, 0.0, types_old_n
+        tie_old = _global_tie(
+            hydro_old_n, conf_old_n, hk_old_n, poly_old_n, weights_global
         )
-        tie_new = combine_tie_breaker(
-            weights, hydro_new_n, conf_new_n, hk_new_n, 0.0, types_new_n
+        tie_new = _global_tie(
+            hydro_new_n, conf_new_n, hk_new_n, poly_new_n, weights_global
         )
+
         final_old = (
             float(args.overall_rule_weight) * r_old["rule_total"]
             + float(args.overall_cont_weight) * tie_old
@@ -1804,40 +2996,65 @@ def main():
         dec_rows.append(
             {
                 "peptide": s0,
-                "decoy_seq": final,
+                "decoy_seq": sF,
                 "selected": False,
                 "is_frameshift": bool(is_fs),
-                "mut_idx0": (int(mut_idx0) if (mut_idx0 is not None) else -1),
-                "edit_path": " → ".join([lab for lab in labels]),
-                # stage values for classic plots
+                "is_hit": (
+                    bool(out_all.loc[i, "is_hit"])
+                    if "is_hit" in out_all.columns
+                    else False
+                ),
+                "mut_idx0": (
+                    -1
+                    if pd.isna(out_all.loc[i, "mut_idx0"])
+                    else int(out_all.loc[i, "mut_idx0"])
+                ),
+                "wt_aa": (
+                    ""
+                    if pd.isna(out_all.loc[i, "wt_aa"])
+                    else str(out_all.loc[i, "wt_aa"])
+                ),
+                "mut_aa": (
+                    ""
+                    if pd.isna(out_all.loc[i, "mut_aa"])
+                    else str(out_all.loc[i, "mut_aa"])
+                ),
+                # Save compressed/clean path info (edits only)
+                "edit_path": " → ".join(edge_labels_disp),
+                "path_stages": "|".join(stage_names_disp),
+                "path_seqs": "|".join(stage_seqs_disp),
+                "path_fly": "|".join(f"{v:.6f}" for v in xvals_disp),
+                "path_conf": "|".join(f"{v:.6f}" for v in yvals_disp),
+                # endpoints
                 "fly0": e0["fly"],
                 "conf0": e0["conf"],
-                "flyN": e1["fly"],
-                "confN": e1["conf"],
-                "flyC": e2["fly"],
-                "confC": e2["conf"],
-                "flyP": e3["fly"],
-                "confP": e3["conf"],
-                "flyM": e4["fly"],
-                "confM": e4["conf"],
-                "flyT": e5["fly"],
-                "confT": e5["conf"],
-                # totals
-                "fly_surface_norm": e5["fly"],
-                "hydrophobic_fraction": e5["hydro"],
-                "conf_mz_multi": e5["conf"],
-                "hk_kmer_frac": e5["hk_frac"],
-                "polymer_conf": e5["polymer_conf"],
-                "polymer_match_flag": int(e5["polymer_match_flag"]),
-                "polymer_best_abs_ppm": e5["polymer_best_abs_ppm"],
-                # rule components
+                "flyT": eF["fly"],
+                "confT": eF["conf"],
+                # final continuous components (fractions 0..1)
+                "fly_surface_norm": eF["fly"],
+                "hydrophobic_fraction": eF["hydro"],  # 0..1
+                "conf_mz_multi": eF["conf"],  # 0..1
+                "hk_kmer_frac": eF["hk_frac"],  # 0..1
+                "polymer_conf": eF["polymer_conf"],  # 0..1
+                "polymer_match_flag": int(eF["polymer_match_flag"]),
+                "polymer_best_abs_ppm": eF["polymer_best_abs_ppm"],
+                # rule totals (raw)
                 "rule_total_old": r_old["rule_total"],
                 "rule_total_new": r_new["rule_total"],
                 "rule_delta": r_new["rule_total"] - r_old["rule_total"],
-                # score components
+                # global dataset composite
                 "start_score": final_old,
                 "final_score": final_new,
                 "delta_total_score": final_new - final_old,
+                # ORIGINAL metrics (counts/fractions)
+                "rk_internal0": origm["rk_internal"],
+                "protons_score0": origm["protons_score"],
+                "sulfur_frac0": origm["sulfur_frac"],
+                "hydrophobic_fraction0": origm["hydro_frac"],
+                # FINAL metrics (counts/fractions)
+                "rk_internal": finalm["rk_internal"],
+                "protons_score": finalm["protons_score"],
+                "sulfur_frac": finalm["sulfur_frac"],
             }
         )
 
@@ -1854,272 +3071,109 @@ def main():
         df_dec["rank_improvement_norm"] = df_dec["rank_improvement"].clip(
             lower=0
         ).astype(float) / float(n_total)
+
     dec_csv = os.path.join(args.outdir, "decoys_all.csv")
     df_dec.to_csv(dec_csv, index=False)
     LOG.info(f"Wrote: {dec_csv} (n={len(df_dec)})")
 
-    # -------------------- Selection (diversity/improvement-aware) -------------
+    # -------------------- Selection (dataset-level; unchanged) ----------------
     N = int(args.N)
     kdedup = int(args.dedup_k)
     require_contam = bool(args.require_contam_match)
     enforce_cterm = bool(args.enforce_hydrophobic_cterm)
+
+    orig_scores = out_all["final_rank_score"].copy()
+    K = min(len(orig_scores), 3 * N)
+    worst_orig_idx = orig_scores.nsmallest(K).index.tolist()
+    sorted_all = orig_scores.sort_values(ascending=False).reset_index(drop=True)
+    threshold_T = (
+        float(sorted_all.iloc[N - 1])
+        if len(sorted_all) >= N
+        else float(sorted_all.iloc[-1])
+    )
+    LOG.info(
+        f"[selection] Top‑N threshold among originals (Nth best) = {threshold_T:.6f}"
+    )
+
+    worst_orig_peps = set(out_all.loc[worst_orig_idx, "seq"].tolist())
+    candidate_mask = df_dec["peptide"].isin(worst_orig_peps) & (
+        df_dec["final_score"] >= threshold_T
+    )
+    remaining = set(df_dec.index[candidate_mask].tolist())
+
     selected_idx = []
     seen_kmers = set()
-    covered_cats: Set[str] = set()
-    remaining = set(df_dec.index.tolist())
 
-    def categories_for_row(rr) -> Set[str]:
-        cats = set()
-        if float(rr["conf_mz_multi"]) >= 0.45:
-            cats.add("protein-like")
-        if int(rr["polymer_match_flag"]) == 1:
-            cats.add("polymer-like")
-        return cats
+    def hard_constraints_ok(rr) -> bool:
+        if require_contam and (float(rr["conf_mz_multi"]) < 0.01):
+            return False
+        if enforce_cterm and (rr["decoy_seq"][-1] not in "FILVWYM"):
+            return False
+        conf_ok = float(rr["conf_mz_multi"]) >= float(
+            args.min_confusability_ratio
+        ) * float(rr["conf0"])
+        if not conf_ok:
+            return False
+        hydro_ok = float(rr["hydrophobic_fraction"]) >= hydrophobic_fraction(
+            rr["peptide"]
+        ) + float(args.hydro_delta_min)
+        if args.require_hydro_increase and not hydro_ok:
+            return False
+        return True
 
     while len(selected_idx) < N and remaining:
-        scored = []
-        for i in list(remaining):
-            rr = df_dec.loc[i]
-            # Hard constraints
-            if require_contam and (float(rr["conf_mz_multi"]) < 0.01):
-                scored.append((i, -1e9))
+        best_i = None
+        best_score = -1e99
+        for irow in list(remaining):
+            rr = df_dec.loc[irow]
+            if not hard_constraints_ok(rr):
                 continue
-            if enforce_cterm and (rr["decoy_seq"][-1] not in "FILVWYM"):
-                scored.append((i, -1e9))
-                continue
-            # conf ratio
-            conf_ok = float(rr["conf_mz_multi"]) >= float(
-                args.min_confusability_ratio
-            ) * float(rr["conf0"])
-            if not conf_ok:
-                scored.append((i, -1e9))
-                continue
-            # hydro increase
-            hydro_ok = float(rr["hydrophobic_fraction"]) >= hydrophobic_fraction(
-                rr["peptide"]
-            ) + float(args.hydro_delta_min)
-            if args.require_hydro_increase and not hydro_ok:
-                scored.append((i, -1e9))
-                continue
-            # k-mer dedup
             if kdedup > 0:
                 kms = kmer_set(rr["decoy_seq"], kdedup)
                 if kms & seen_kmers:
-                    scored.append((i, -1e6))
                     continue
-            # novelty + improvement bonus
-            cats = categories_for_row(rr)
-            novelty = len(cats - covered_cats) / 3.0
-            aug = (
-                float(rr["final_score"])
-                + float(args.diversity_bonus) * novelty
-                + float(args.improvement_bonus) * float(rr["rank_improvement_norm"])
-            )
-            scored.append((i, aug))
-        if not scored:
-            break
-        scored.sort(key=lambda t: t[1], reverse=True)
-        best_i, best_aug = scored[0]
-        if best_aug < -1e8:
+            sc = float(rr["final_score"])
+            if sc > best_score:
+                best_score = sc
+                best_i = irow
+        if best_i is None:
             break
         selected_idx.append(best_i)
         df_dec.at[best_i, "selected"] = True
-        rr = df_dec.loc[best_i]
         if kdedup > 0:
-            for km in kmer_set(rr["decoy_seq"], kdedup):
+            for km in kmer_set(df_dec.loc[best_i, "decoy_seq"], kdedup):
                 seen_kmers.add(km)
-        covered_cats |= categories_for_row(rr)
         remaining.remove(best_i)
 
     selected = (
         df_dec.loc[selected_idx].copy().sort_values("final_score", ascending=False)
     )
-    df_dec.to_csv(dec_csv, index=False)  # re-write with selected flags
-
+    df_dec.to_csv(dec_csv, index=False)
     sel_csv = os.path.join(args.outdir, "decoys_selected_topN.csv")
     selected.to_csv(sel_csv, index=False)
     LOG.info(f"Wrote: {sel_csv} (n={len(selected)})")
 
-    # -------------------- Plots -----------------------------------------------
-    plots_dir = os.path.join(args.outdir, "plots")
-    ep_dir = os.path.join(plots_dir, "edit_paths")
-    ensure_outdir(ep_dir)
-
-    # selected first (rank order), then a subset of non-selected
-    sel_sorted = selected.reset_index(drop=True)
-    for rank, rr in enumerate(
-        tqdm(
-            sel_sorted.itertuples(index=False),
-            total=len(sel_sorted),
-            disable=bool(args.no_progress),
-            desc="EditPaths(SEL)",
-        )
-    ):
-        seqs = [
-            rr.peptide,
-            rr.peptide,
-            rr.peptide,
-            rr.peptide,
-            rr.peptide,
-            rr.decoy_seq,
-        ]  # labels show stages; seq text is illustrative
-        xvals = [rr.fly0, rr.flyN, rr.flyC, rr.flyP, rr.flyM, rr.flyT]
-        yvals = [rr.conf0, rr.confN, rr.confC, rr.confP, rr.confM, rr.confT]
-        classic_edit_path_plot(
-            ep_dir,
-            rank + 1,
-            True,
-            seqs,
-            xvals,
-            yvals,
-            title_extra=f"Δscore={rr.delta_total_score:.3f}",
-            max_label_len=args.trace_label_maxlen,
-        )
-
-    non = df_dec.loc[df_dec["selected"] != True].reset_index(drop=True)
-    for i, rr in enumerate(
-        tqdm(
-            non.itertuples(index=False),
-            total=len(non),
-            disable=bool(args.no_progress),
-            desc="EditPaths(NOT)",
-        )
-    ):
-        seqs = [
-            rr.peptide,
-            rr.peptide,
-            rr.peptide,
-            rr.peptide,
-            rr.peptide,
-            rr.decoy_seq,
-        ]
-        xvals = [rr.fly0, rr.flyN, rr.flyC, rr.flyP, rr.flyM, rr.flyT]
-        yvals = [rr.conf0, rr.confN, rr.confC, rr.confP, rr.confM, rr.confT]
-        classic_edit_path_plot(
-            ep_dir,
-            i + 1,
-            False,
-            seqs,
-            xvals,
-            yvals,
-            title_extra=f"Δscore={rr.delta_total_score:.3f}",
-            max_label_len=args.trace_label_maxlen,
-        )
-
-    # score decomposition for selected
-    if len(selected):
-        parts = [
-            ("fly_surface_norm", weights.get("fly", 0.25)),
-            ("hydrophobic_fraction", weights.get("hydro", 0.25)),
-            ("conf_mz_multi", weights.get("conf_mz", 0.15)),
-            ("hk_kmer_frac", weights.get("term", 0.10)),
-            ("polymer_conf", weights.get("polymer", 0.20)),
-        ]
-        fig, ax = plt.subplots(figsize=(max(8, 0.6 * len(selected)), 4.2))
-        ssel = selected.sort_values("final_score", ascending=False).reset_index(
-            drop=True
-        )
-        x = np.arange(len(ssel))
-        bottom = np.zeros(len(ssel), dtype=float)
-        for col, wv in parts:
-            contrib = float(wv) * ssel[col].fillna(0).to_numpy(float)
-            ax.bar(x, contrib, bottom=bottom, label=f"{col}×{float(wv):.2f}")
-            bottom += contrib
-        ax.set_xticks(x)
-        ax.set_xticklabels([str(i + 1) for i in x])
-        ax.set_ylabel("Final score (weighted, illustrative)")
-        ax.set_title("Final-score decomposition (selected)")
-        ax.legend()
-        _grid(ax)
-        fig.tight_layout()
-        fig.savefig(
-            os.path.join(plots_dir, "selected_final_score_decomposition.png"), dpi=150
-        )
-        plt.close(fig)
-
-    # density-aware scatter plots
-    density_pairs = [
-        (
-            "fly_surface_norm",
-            "conf_mz_multi",
-            "scatter_fly_vs_conf.png",
-            "confusability vs fly (KD)",
-        ),
-        ("final_score", "fly_surface_norm", "scatter_final_vs_fly.png", "final vs fly"),
-        ("final_score", "conf_mz_multi", "scatter_final_vs_conf.png", "final vs conf"),
-        (
-            "final_score",
-            "hk_kmer_frac",
-            "scatter_final_vs_hk.png",
-            "final vs housekeeping k-mer frac",
-        ),
-        (
-            "final_score",
-            "polymer_conf",
-            "scatter_final_vs_polymer.png",
-            "final vs polymer-like proximity",
-        ),
-    ]
-    for x, y, f, t in density_pairs:
-        density_scatter_sel_vs_not(
-            df_dec,
-            x,
-            y,
-            "selected",
-            os.path.join(plots_dir, f),
-            args.dense_threshold,
-            title=t,
-        )
-
-    # Δ distributions
-    def _hist(col: str, fn: str, title: str):
-        if df_dec.empty or col not in df_dec.columns:
-            return
-        fig, ax = plt.subplots()
-        ax.hist(df_dec[col].dropna().to_numpy(float), bins=30, alpha=0.8)
-        ax.set_xlabel(col)
-        ax.set_ylabel("count")
-        ax.set_title(title)
-        _grid(ax)
-        fig.tight_layout()
-        fig.savefig(os.path.join(plots_dir, fn), dpi=150)
-        plt.close(fig)
-
-    _hist(
-        "delta_total_score",
-        "hist_delta_total_score.png",
-        "Distribution of final score improvements",
+    # -------------------- Unit sanity checks ---------------------------------
+    _warn_if_integerish("rk_internal0", df_dec["rk_internal0"].to_numpy(float))
+    _warn_if_integerish("rk_internal", df_dec["rk_internal"].to_numpy(float))
+    _warn_if_fraction(
+        "hydrophobic_fraction0", df_dec["hydrophobic_fraction0"].to_numpy(float)
     )
-    _hist("rule_delta", "hist_rule_delta.png", "Distribution of rule score changes")
-
-    def _scatter_with_diag(xcol: str, ycol: str, fn: str, title: str):
-        if df_dec.empty or (xcol not in df_dec.columns) or (ycol not in df_dec.columns):
-            return
-        fig, ax = plt.subplots()
-        ax.scatter(df_dec[xcol], df_dec[ycol], s=14, alpha=0.6)
-        v = np.r_[df_dec[xcol].to_numpy(float), df_dec[ycol].to_numpy(float)]
-        mn = float(np.nanmin(v))
-        mx = float(np.nanmax(v))
-        ax.plot([mn, mx], [mn, mx], ls="--", lw=1, color="gray")
-        ax.set_xlabel(xcol)
-        ax.set_ylabel(ycol)
-        ax.set_title(title)
-        _grid(ax)
-        fig.tight_layout()
-        fig.savefig(os.path.join(plots_dir, fn), dpi=150)
-        plt.close(fig)
-
-    _scatter_with_diag(
-        "start_score",
-        "final_score",
-        "scatter_final_vs_start_score.png",
-        "Final vs Start score",
+    _warn_if_fraction(
+        "hydrophobic_fraction", df_dec["hydrophobic_fraction"].to_numpy(float)
     )
-    _scatter_with_diag(
-        "start_rank",
-        "end_rank",
-        "scatter_end_vs_start_rank.png",
-        "End rank vs Start rank",
+    _warn_if_fraction("sulfur_frac0", df_dec["sulfur_frac0"].to_numpy(float))
+    _warn_if_fraction("sulfur_frac", df_dec["sulfur_frac"].to_numpy(float))
+    _warn_if_fraction("conf0", df_dec["conf0"].to_numpy(float))
+    _warn_if_fraction("confT", df_dec["confT"].to_numpy(float))
+
+    # -------------------- Plots (extracted) ---------------------------------
+    render_all_plots(
+        df_dec=df_dec,
+        outdir=args.outdir,
+        trace_label_maxlen=args.trace_label_maxlen,
+        dense_threshold=args.dense_threshold,
+        no_progress=bool(args.no_progress),
     )
 
     # README
@@ -2127,37 +3181,45 @@ def main():
         fh.write(
             "\n".join(
                 [
-                    "# Decoy generation with classic edit-path plots (HK/frameshift)",
+                    "# Decoy generation (RULE-FIRST; mutation-aware; charge heuristic)",
                     "",
-                    "## Sets",
-                    f"Sets: {', '.join(set_names)}",
-                    "No FASTA fallbacks; use --sets-fasta-dir or --download-sets 1",
+                    "## Rule components (raw, no normalization)",
+                    "- N-term: +1 good; −1 weak-bad; −2 strong-bad",
+                    "- Proline context: +2 GP (well-placed), +1 GP edge or AP, +0.5 weak-good, 0 neutral, −1 KR-before-P",
+                    "- C-term hydrophobic: +1; Ala C-term is frozen",
+                    "- Internal 'bad' (e.g., Q): −1; Internal C: +1; Internal M: +1",
+                    "- Basic-site rule: +1 internal R/K; 0 only H; −1 none",
+                    "- Tie reducers: +0.5 if ≥4 internal hydrophobics; +0.25 if C/M on opposite sides of P",
+                    "- Charge rule A: +1 if predicted precursor z∈[2,4] and ≥1 predicted fragment (w/ pruning) has charge ≥2",
+                    "- Charge rule B (new): +1 if predicted precursor z∈{2,3,4} and ≥3 predicted fragments (w/ pruning) have charge 2 or 3",
                     "",
-                    "## Housekeeping homology (WIQD parity)",
-                    f"- hk_kmer_frac uses k={args.hk_k} and collapse={args.hk_collapse}.",
-                    "- Term weight in rank-weights maps to HK k-mer norm.",
+                    "## Skip & mutation logic",
+                    "- Skip a stage if its criterion is already met (e.g., P already internal → skip P stage).",
+                    "- RK stage additionally skips if **any R exists anywhere** in the sequence (including termini).",
+                    "- Non-frameshift: first internal edit must occur at the mutant site, never setting WT or MUT residue.",
+                    "- Special: mut P→C → always skip C stage; P stage skips that position but may edit elsewhere later.",
+                    "- P placements: 1-based positions in [4 .. n-2]; never edit residue before Proline.",
                     "",
-                    "## Frameshifts",
-                    "- 'fs' in mutation notation: no mut index required; allows placing 'C' at any position if none is present.",
-                    "- Steps remain Nterm → C → P → M → Cterm, skipping already-good stages.",
+                    "## Termini and permutations",
+                    "- Termini: keep top-K by rule (beam) at N-term then C-term.",
+                    "- Internal permutations of {P,C,M,RK} with per-stage beam pruning by rule_total.",
+                    "- End of permutation: keep all sequences at the permutation's max rule_total; across permutations, keep global rule-best.",
                     "",
-                    "## Scores",
-                    "- Rule score (integer) and continuous tie-breakers (fly, conf, HK k-mer, polymer, types).",
-                    "- Final score = rule_weight × rule_total + cont_weight × tie_break_score.",
+                    "## Final winner per peptide",
+                    "- Combine **confusability (0–1)** and **hydrophobic fraction (0–1)** with --perm-combine-weights.",
+                    "- Ties: higher hydrophobicity → longer HK substring → fewer D/E → lexicographic.",
+                    "",
+                    "## Global composite (dataset ranking)",
+                    "- Normalized combination: hydro + conf_mz + hk (+ optional polymer), weights via --rank-weights.",
                     "",
                     "## Selection",
-                    f"- N={args.N}, k-de-dup k={args.dedup_k}, diversity_bonus={args.diversity_bonus}, improvement_bonus={args.improvement_bonus}.",
-                    f"- Hard constraints: conf_new ≥ {args.min_confusability_ratio:.2f}×conf_old; "
-                    f"{'require hydrophobic C-term; ' if bool(args.enforce_hydrophobic_cterm) else ''}"
-                    f"{'hydro_new ≥ hydro_old + δ' if bool(args.require_hydro_increase) else 'no hydro increase required'}.",
+                    "- Bottom 2*N originals define candidate pool; threshold T = Nth best original; select decoys >= T with constraints.",
                     "",
-                    "## Plots",
-                    "- Classic edit paths: plots/edit_paths/path_*.png",
-                    "- Score decomposition, density scatters, Δ distributions, final vs start, rank plots.",
+                    "## Visualization",
+                    "- Edit paths now **only include actual edits** (keep steps hidden). Nodes are annotated with both the stage and the exact edit label (e.g., `P@7`).",
                 ]
             )
         )
-
     LOG.info(
         f"[DONE] Selected {len(selected)} / {len(df_dec)} decoys. Outdir: {args.outdir}"
     )

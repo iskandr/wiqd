@@ -19,5 +19,8 @@ for infile in combined-pfo002-repeat-pfo010.csv; do
     --download_sets \
     --rt off \
     --q1 0.4Da \
-    --plots-top-k 1
+    --plots-top-k 1 \
+    --run-grid  \
+     --top-n 25
+
 done
